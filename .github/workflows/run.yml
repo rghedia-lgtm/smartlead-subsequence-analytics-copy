@@ -1,0 +1,54 @@
+name: Subsequence Analytics
+
+on:
+  schedule:
+    - cron: '0 * * * *'     # every hour
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  analytics:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run subsequence analytics script
+        env:
+          SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
+        run: python subsequence_analytics.py
+
+      - name: Publish dashboard to docs/
+        run: |
+          mkdir -p docs
+          cp reports/dashboard_*.html docs/index.html
+
+      - name: Commit and push updated dashboard
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html
+          git diff --cached --quiet || git commit -m "chore: update dashboard [skip ci]"
+          git push
+
+      - name: Upload analytics CSV as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: subsequence-analytics-${{ github.run_number }}
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 30

@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"\\\\.\\(html|js|css|json\\)$\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('subsequence_analytics.py'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('subsequence_analytics.py', encoding='utf-8'\\).read\\(\\)\\); print\\('Syntax OK'\\)\")",
+      "Bash(python subsequence_analytics.py)",
+      "Bash(grep -n \"docs/index\\\\|docs\\\\\\\\\\\\\\\\index\" D:/Smartlead-Automation/smartlead-subsequence-analytics/subsequence_analytics.py)",
+      "Bash(git -C \"D:\\\\Smartlead-Automation\\\\smartlead-subsequence-analytics - Copy\" remote -v)",
+      "Bash(gh repo *)",
+      "Bash(gh auth *)"
+    ]
+  }
+}
