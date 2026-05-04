@@ -363,8 +363,30 @@ def api_zoho_sync():
 # ── Helpers for export / email ────────────────────────────────────────
 
 def _safe_text(s):
-    """Sanitise string for fpdf2 latin-1 core fonts."""
-    return str(s or "").encode("latin-1", "replace").decode("latin-1")
+    """Sanitise string for fpdf2 latin-1 core fonts.
+    Substitute common Unicode chars that the core font can't render
+    (em-dash, middle dot, arrows, smart quotes) with ASCII equivalents
+    before falling back to latin-1 with replace."""
+    if not s:
+        return ""
+    s = str(s)
+    repl = {
+        "—": "-",   # em-dash —
+        "–": "-",   # en-dash –
+        "·": "|",   # middle dot ·
+        "•": "*",   # bullet •
+        "→": "->",  # right arrow →
+        "←": "<-",  # left arrow ←
+        "…": "...", # ellipsis …
+        "‘": "'",   # left single quote ‘
+        "’": "'",   # right single quote ’
+        "“": '"',   # left double quote “
+        "”": '"',   # right double quote ”
+        " ": " ",   # nbsp
+    }
+    for k, v in repl.items():
+        s = s.replace(k, v)
+    return s.encode("latin-1", "replace").decode("latin-1")
 
 def _get_lead_last_activity(lead):
     dates = [d for d in [lead.get("reply_time"), lead.get("open_time"),
@@ -377,59 +399,262 @@ def _get_lead_summary(lead):
         return ""
     return ((msgs[-1].get("body") or "")[:150])
 
-def _build_report_pdf(parent_data, sub_data):
+def _pct(num, den):
+    return f"{(num/den*100):.1f}%" if den else "—"
+
+
+def _compute_date_range(parent_data, sub_data):
+    """Find earliest sent_time and latest activity time across all leads."""
+    times = []
+    for collection in (parent_data or [], sub_data or []):
+        for row in collection:
+            for l in row.get("leads", []):
+                for k in ("sent_time", "open_time", "click_time", "reply_time"):
+                    v = l.get(k)
+                    if v and isinstance(v, str) and len(v) >= 10:
+                        times.append(v[:10])
+    if not times:
+        return None, None
+    return min(times), max(times)
+
+
+def _build_summary_paragraph(client_name, summary, parent_data, sub_data, pos_leads):
+    """Generate a 2–3 sentence executive summary using the actual numbers."""
+    label = client_name or "All Clients"
+    date_from, date_to = _compute_date_range(parent_data, sub_data)
+    range_str = (f" (data from {date_from} to {date_to})"
+                 if date_from and date_to and date_from != date_to
+                 else (f" (data on {date_from})" if date_from else ""))
+    sent          = summary.get("sent", 0)
+    opened        = summary.get("opened", 0)
+    replied       = summary.get("replied", 0)
+    added_sub     = summary.get("added_to_sub", 0)
+    sub_total     = summary.get("sub_total", 0)
+    sub_opened    = summary.get("sub_opened", 0)
+    sub_replied   = summary.get("sub_replied", 0)
+    positive      = summary.get("positive", len(pos_leads or []))
+    bounced       = summary.get("bounced", 0)
+    n_camps       = len(parent_data or [])
+    n_subs        = len(sub_data or [])
+
+    s1 = (f"{label} ran {n_camps} parent campaign{'s' if n_camps != 1 else ''}{range_str} "
+          f"with {sent:,} emails sent — {opened:,} opens ({_pct(opened, sent)}) "
+          f"and {replied:,} replies ({_pct(replied, sent)}).")
+    s2 = (f"{added_sub:,} leads ({_pct(added_sub, sent)}) were added to {n_subs} "
+          f"subsequence{'s' if n_subs != 1 else ''}, where {sub_opened:,} "
+          f"opened ({_pct(sub_opened, sub_total)}) and {sub_replied:,} replied "
+          f"({_pct(sub_replied, sub_total)}).")
+    s3 = (f"{positive:,} positive repl{'ies' if positive != 1 else 'y'} "
+          f"identified · {bounced:,} bounced.")
+    return " ".join([s1, s2, s3])
+
+
+def _compute_summary(parent_data, sub_data):
+    def s(rows, key): return sum((r.get(key) or 0) for r in rows)
+    sent = s(parent_data, "total")
+    sub_total = s(sub_data, "total")
+    return {
+        "sent":         sent,
+        "opened":       s(parent_data, "opened"),
+        "clicked":      s(parent_data, "clicked"),
+        "replied":      s(parent_data, "replied"),
+        "added_to_sub": s(parent_data, "added_to_sub"),
+        "bounced":      s(parent_data, "bounced"),
+        "unsubscribed": s(parent_data, "unsubscribed"),
+        "positive":     s(parent_data, "positive"),
+        "sub_total":    sub_total,
+        "sub_opened":   s(sub_data, "opened"),
+        "sub_clicked":  s(sub_data, "clicked"),
+        "sub_replied":  s(sub_data, "replied"),
+    }
+
+
+def _build_report_pdf(parent_data, sub_data, client_name=None,
+                      summary=None, positive_leads=None):
+    """PDF report matching the on-screen layout: header → summary cards
+    → parent campaigns → subsequences → positive leads."""
     from fpdf import FPDF
     import io
+
+    if summary is None:
+        summary = _compute_summary(parent_data, sub_data)
 
     pdf = FPDF()
     pdf.set_auto_page_break(auto=True, margin=15)
     pdf.add_page()
+
+    # ── Header ──────────────────────────────────────────────────────
+    title = (f"{client_name} — Client Dashboard Report"
+             if client_name else "Smartlead Analytics Report")
+    pdf.set_fill_color(31, 27, 75)
+    pdf.set_text_color(255, 255, 255)
     pdf.set_font("Helvetica", "B", 16)
-    pdf.cell(0, 10, _safe_text("Smartlead Analytics Report"), ln=True)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.cell(0, 6, _safe_text(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"), ln=True)
-    pdf.ln(4)
-
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Main Campaign Analytics", ln=True)
+    pdf.cell(0, 12, _safe_text(title), ln=True, fill=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.set_font("Helvetica", "", 9)
+    date_from, date_to = _compute_date_range(parent_data, sub_data)
+    range_meta = (f"   ·   Data range: {date_from} → {date_to}"
+                  if date_from and date_to else "")
+    pdf.cell(0, 6, _safe_text(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                              + (f"   ·   Campaigns: {len(parent_data)}   ·   Subsequences: {len(sub_data)}" if client_name else "")
+                              + range_meta),
+             ln=True)
     pdf.ln(2)
-    hdrs  = ["Client", "Total", "Opened", "Replied", "Added to Sub", "Positive"]
-    col_w = [38, 20, 20, 20, 30, 22]
+
+    # ── 2-3 line executive summary ──────────────────────────────────
+    paragraph = _build_summary_paragraph(client_name, summary, parent_data, sub_data, positive_leads)
+    pdf.set_fill_color(238, 242, 255)
+    pdf.set_draw_color(199, 210, 254)
+    y = pdf.get_y()
+    # Reserve box height; multi_cell auto-wraps
     pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(240, 242, 245)
-    for h, w in zip(hdrs, col_w):
-        pdf.cell(w, 7, h, border=1, fill=True)
+    pdf.set_text_color(67, 56, 202)
+    pdf.cell(0, 6, _safe_text("Executive Summary"), ln=True, fill=True, border="LTR")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(30, 41, 59)
+    pdf.set_x(pdf.l_margin)
+    pdf.multi_cell(0, 5, _safe_text(paragraph), border="LBR", fill=True)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
+
+    # ── Summary cards (11 stats in a 4-col grid) ────────────────────
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, _safe_text("Summary Overview"), ln=True)
+    pdf.ln(1)
+
+    cards = [
+        ("Sent",          summary.get("sent", 0),         None),
+        ("Opened",        summary.get("opened", 0),       _pct(summary.get("opened", 0),  summary.get("sent", 0))),
+        ("Clicked",       summary.get("clicked", 0),      _pct(summary.get("clicked", 0), summary.get("sent", 0))),
+        ("Replied",       summary.get("replied", 0),      _pct(summary.get("replied", 0), summary.get("sent", 0))),
+        ("Added to Sub",  summary.get("added_to_sub", 0), _pct(summary.get("added_to_sub", 0), summary.get("sent", 0))),
+        ("Sub Opened",    summary.get("sub_opened", 0),   _pct(summary.get("sub_opened", 0),   summary.get("sub_total", 0))),
+        ("Sub Clicked",   summary.get("sub_clicked", 0),  _pct(summary.get("sub_clicked", 0),  summary.get("sub_total", 0))),
+        ("Sub Replied",   summary.get("sub_replied", 0),  _pct(summary.get("sub_replied", 0),  summary.get("sub_total", 0))),
+        ("Positive Replies", summary.get("positive", 0),  None),
+        ("Bounced",       summary.get("bounced", 0),      None),
+        ("Unsubscribed",  summary.get("unsubscribed", 0), None),
+    ]
+    card_w, card_h = 45, 18
+    cols = 4
+    for i, (lbl, val, sub) in enumerate(cards):
+        if i and i % cols == 0:
+            pdf.ln(card_h + 1)
+        x = pdf.get_x()
+        y = pdf.get_y()
+        # Card background
+        pdf.set_fill_color(248, 250, 252)
+        pdf.set_draw_color(226, 232, 240)
+        pdf.rect(x, y, card_w, card_h, style="DF")
+        # Big value
+        pdf.set_xy(x + 2, y + 2)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.set_text_color(30, 41, 59)
+        pdf.cell(card_w - 4, 6, _safe_text(f"{val:,}" if isinstance(val, (int, float)) else str(val)))
+        # Label
+        pdf.set_xy(x + 2, y + 9)
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(100, 116, 139)
+        pdf.cell(card_w - 4, 4, _safe_text(lbl))
+        # Sub (rate)
+        if sub:
+            pdf.set_xy(x + 2, y + 13)
+            pdf.set_font("Helvetica", "B", 7)
+            pdf.set_text_color(79, 70, 229)
+            pdf.cell(card_w - 4, 4, _safe_text(sub))
+        pdf.set_xy(x + card_w + 1, y)
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(card_h + 6)
+
+    # ── Parent Campaigns table ──────────────────────────────────────
+    pdf.set_font("Helvetica", "B", 12)
+    pdf.cell(0, 8, _safe_text("Parent Campaigns"), ln=True)
+    pdf.ln(1)
+    p_hdrs = ["Campaign", "Status", "Total", "Opened", "Clicked", "Replied",
+              "Bounced", "Added Sub", "Open %", "Reply %"]
+    p_w    = [60, 18, 14, 16, 16, 16, 16, 18, 14, 14]
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.set_fill_color(241, 245, 249)
+    for h, w in zip(p_hdrs, p_w):
+        pdf.cell(w, 7, _safe_text(h), border=1, fill=True)
     pdf.ln()
-    pdf.set_font("Helvetica", "", 8)
+    pdf.set_font("Helvetica", "", 7)
     for r in parent_data:
-        for val, w in zip(
-            [r.get("client",""), r.get("total",0), r.get("opened",0),
-             r.get("replied",0), r.get("added_to_sub",0), r.get("positive",0)],
-            col_w
-        ):
-            pdf.cell(w, 6, _safe_text(str(val)[:35]), border=1)
+        vals = [
+            (r.get("raw_name") or r.get("client", ""))[:42],
+            r.get("status", "—"),
+            f"{r.get('total', 0):,}",
+            f"{r.get('opened', 0):,}",
+            f"{r.get('clicked', 0):,}",
+            f"{r.get('replied', 0):,}",
+            f"{r.get('bounced', 0):,}",
+            f"{r.get('added_to_sub', 0):,}",
+            f"{(r.get('open_rate') or 0):.1f}%",
+            f"{(r.get('reply_rate') or 0):.1f}%",
+        ]
+        for v, w in zip(vals, p_w):
+            pdf.cell(w, 5.5, _safe_text(str(v)), border=1)
         pdf.ln()
 
-    pdf.ln(6)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.cell(0, 8, "Subsequence Analytics", ln=True)
-    pdf.ln(2)
-    hdrs2  = ["Client", "Subsequence", "Total", "Opened", "Clicked", "Replied"]
-    col_w2 = [30, 55, 18, 18, 18, 18]
-    pdf.set_font("Helvetica", "B", 9)
-    pdf.set_fill_color(240, 242, 245)
-    for h, w in zip(hdrs2, col_w2):
-        pdf.cell(w, 7, h, border=1, fill=True)
-    pdf.ln()
-    pdf.set_font("Helvetica", "", 8)
-    for r in sub_data:
-        for val, w in zip(
-            [r.get("parent",""), r.get("subsequence",""), r.get("total",0),
-             r.get("opened",0), r.get("clicked",0), r.get("replied",0)],
-            col_w2
-        ):
-            pdf.cell(w, 6, _safe_text(str(val)[:40]), border=1)
+    # ── Subsequences table (only those with leads) ──────────────────
+    active_subs = [s for s in (sub_data or []) if (s.get("total") or 0) > 0]
+    if active_subs:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, _safe_text(f"Subsequences ({len(active_subs)} active of {len(sub_data)})"), ln=True)
+        pdf.ln(1)
+        s_hdrs = ["Subsequence", "Total", "Opened", "Clicked", "Replied", "Open %", "Reply %"]
+        s_w    = [80, 18, 18, 18, 18, 18, 18]
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(241, 245, 249)
+        for h, w in zip(s_hdrs, s_w):
+            pdf.cell(w, 7, _safe_text(h), border=1, fill=True)
         pdf.ln()
+        pdf.set_font("Helvetica", "", 7)
+        # Sort by total desc so biggest subs come first
+        active_subs.sort(key=lambda r: -(r.get("total") or 0))
+        for r in active_subs:
+            vals = [
+                (r.get("subsequence") or r.get("parent", ""))[:48],
+                f"{r.get('total', 0):,}",
+                f"{r.get('opened', 0):,}",
+                f"{r.get('clicked', 0):,}",
+                f"{r.get('replied', 0):,}",
+                f"{(r.get('open_rate') or 0):.1f}%",
+                f"{(r.get('reply_rate') or 0):.1f}%",
+            ]
+            for v, w in zip(vals, s_w):
+                pdf.cell(w, 5.5, _safe_text(str(v)), border=1)
+            pdf.ln()
+
+    # ── Positive Leads ──────────────────────────────────────────────
+    if positive_leads:
+        pdf.ln(4)
+        pdf.set_font("Helvetica", "B", 12)
+        pdf.cell(0, 8, _safe_text(f"Positive Leads ({len(positive_leads)})"), ln=True)
+        pdf.ln(1)
+        l_hdrs = ["Lead", "Email", "Category", "Reply Date", "Campaign"]
+        l_w    = [42, 60, 24, 22, 54]
+        pdf.set_font("Helvetica", "B", 8)
+        pdf.set_fill_color(241, 245, 249)
+        for h, w in zip(l_hdrs, l_w):
+            pdf.cell(w, 7, _safe_text(h), border=1, fill=True)
+        pdf.ln()
+        pdf.set_font("Helvetica", "", 7)
+        for l in positive_leads[:60]:  # cap to keep PDF reasonable
+            vals = [
+                (l.get("name") or "")[:30],
+                (l.get("email") or "")[:42],
+                (l.get("category") or l.get("status") or "")[:18],
+                (l.get("reply_time") or l.get("last_activity") or "")[:10],
+                (l.get("campaign") or l.get("source") or "")[:38],
+            ]
+            for v, w in zip(vals, l_w):
+                pdf.cell(w, 5.5, _safe_text(str(v)), border=1)
+            pdf.ln()
+        if len(positive_leads) > 60:
+            pdf.set_font("Helvetica", "I", 7)
+            pdf.cell(0, 5, _safe_text(f"… {len(positive_leads) - 60} more leads not shown"), ln=True)
 
     return io.BytesIO(pdf.output())
 
@@ -514,15 +739,28 @@ def api_positive_leads():
         return jsonify({"error": str(e)}), 500
 
 
+def _extract_export_args(body):
+    """Pull the per-client filtered payload out of the request body, with cache fallback."""
+    cache       = EMAIL_CACHE.get("data") or {}
+    parent_data = body.get("parent_analytics", cache.get("parent_analytics", []))
+    sub_data    = body.get("sub_analytics",    cache.get("sub_analytics",    []))
+    client_name = body.get("client") or None
+    summary     = body.get("summary") or _compute_summary(parent_data, sub_data)
+    pos_leads   = body.get("positive_leads") or []
+    return parent_data, sub_data, client_name, summary, pos_leads
+
+
 @app.route("/api/export/pdf", methods=["POST"])
 def api_export_pdf():
     try:
-        body        = request.get_json(silent=True) or {}
-        cache       = EMAIL_CACHE.get("data") or {}
-        parent_data = body.get("parent_analytics", cache.get("parent_analytics", []))
-        sub_data    = body.get("sub_analytics",    cache.get("sub_analytics",    []))
-        buf      = _build_report_pdf(parent_data, sub_data)
-        filename = f"analytics_{datetime.now().strftime('%Y%m%d')}.pdf"
+        body = request.get_json(silent=True) or {}
+        parent_data, sub_data, client_name, summary, pos_leads = _extract_export_args(body)
+        buf = _build_report_pdf(parent_data, sub_data,
+                                client_name=client_name,
+                                summary=summary,
+                                positive_leads=pos_leads)
+        slug = (client_name or "all").lower().replace(" ", "_")
+        filename = f"{slug}_analytics_{datetime.now().strftime('%Y%m%d')}.pdf"
         return send_file(buf, mimetype="application/pdf",
                          as_attachment=True, download_name=filename)
     except ImportError:
@@ -536,50 +774,117 @@ def api_export_pdf():
 def api_export_docx():
     try:
         from docx import Document
+        from docx.shared import Pt, RGBColor, Inches
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
         import io
 
-        body        = request.get_json(silent=True) or {}
-        cache       = EMAIL_CACHE.get("data") or {}
-        parent_data = body.get("parent_analytics", cache.get("parent_analytics", []))
-        sub_data    = body.get("sub_analytics",    cache.get("sub_analytics",    []))
+        body = request.get_json(silent=True) or {}
+        parent_data, sub_data, client_name, summary, pos_leads = _extract_export_args(body)
 
         doc = Document()
-        doc.add_heading("Smartlead Analytics Report", 0)
-        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        title = (f"{client_name} — Client Dashboard Report"
+                 if client_name else "Smartlead Analytics Report")
+        h = doc.add_heading(title, 0)
+        sub = doc.add_paragraph()
+        sub.add_run(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}").italic = True
+        if client_name:
+            sub.add_run(f"   ·   Campaigns: {len(parent_data)}   ·   Subsequences: {len(sub_data)}").italic = True
+        df, dt = _compute_date_range(parent_data, sub_data)
+        if df and dt:
+            sub.add_run(f"   ·   Data range: {df} → {dt}").italic = True
 
-        doc.add_heading("Main Campaign Analytics", level=1)
-        tbl = doc.add_table(rows=1, cols=6)
-        tbl.style = "Table Grid"
-        for i, h in enumerate(["Client", "Total", "Opened", "Replied", "Added to Sub", "Positive"]):
-            tbl.rows[0].cells[i].text = h
+        # ── Executive Summary (2-3 sentences) ────────────────────────
+        doc.add_heading("Executive Summary", level=1)
+        para = doc.add_paragraph(
+            _build_summary_paragraph(client_name, summary, parent_data, sub_data, pos_leads)
+        )
+        para.runs[0].font.size = Pt(11)
+
+        # ── Summary ─────────────────────────────────────────────────
+        doc.add_heading("Summary Overview", level=1)
+        sum_tbl = doc.add_table(rows=1, cols=3)
+        sum_tbl.style = "Light Grid Accent 1"
+        for i, h in enumerate(["Metric", "Value", "Rate"]):
+            sum_tbl.rows[0].cells[i].text = h
+        rows = [
+            ("Sent",          summary.get("sent", 0),         "—"),
+            ("Opened",        summary.get("opened", 0),       _pct(summary.get("opened", 0),       summary.get("sent", 0))),
+            ("Clicked",       summary.get("clicked", 0),      _pct(summary.get("clicked", 0),      summary.get("sent", 0))),
+            ("Replied",       summary.get("replied", 0),      _pct(summary.get("replied", 0),      summary.get("sent", 0))),
+            ("Added to Sub",  summary.get("added_to_sub", 0), _pct(summary.get("added_to_sub", 0), summary.get("sent", 0))),
+            ("Sub Opened",    summary.get("sub_opened", 0),   _pct(summary.get("sub_opened", 0),   summary.get("sub_total", 0))),
+            ("Sub Clicked",   summary.get("sub_clicked", 0),  _pct(summary.get("sub_clicked", 0),  summary.get("sub_total", 0))),
+            ("Sub Replied",   summary.get("sub_replied", 0),  _pct(summary.get("sub_replied", 0),  summary.get("sub_total", 0))),
+            ("Positive Replies", summary.get("positive", 0),  "—"),
+            ("Bounced",       summary.get("bounced", 0),      "—"),
+            ("Unsubscribed",  summary.get("unsubscribed", 0), "—"),
+        ]
+        for lbl, val, rate in rows:
+            cells = sum_tbl.add_row().cells
+            cells[0].text = lbl
+            cells[1].text = f"{val:,}"
+            cells[2].text = rate
+
+        # ── Parent Campaigns ────────────────────────────────────────
+        doc.add_heading("Parent Campaigns", level=1)
+        tbl = doc.add_table(rows=1, cols=10)
+        tbl.style = "Light Grid Accent 1"
+        for i, hd in enumerate(["Campaign", "Status", "Total", "Opened", "Clicked",
+                                "Replied", "Bounced", "Added to Sub", "Open %", "Reply %"]):
+            tbl.rows[0].cells[i].text = hd
         for r in parent_data:
             cells = tbl.add_row().cells
-            cells[0].text = str(r.get("client", ""))
-            cells[1].text = str(r.get("total", 0))
-            cells[2].text = str(r.get("opened", 0))
-            cells[3].text = str(r.get("replied", 0))
-            cells[4].text = str(r.get("added_to_sub", 0))
-            cells[5].text = str(r.get("positive", 0))
+            cells[0].text = str(r.get("raw_name") or r.get("client", ""))
+            cells[1].text = str(r.get("status", "—"))
+            cells[2].text = f"{r.get('total', 0):,}"
+            cells[3].text = f"{r.get('opened', 0):,}"
+            cells[4].text = f"{r.get('clicked', 0):,}"
+            cells[5].text = f"{r.get('replied', 0):,}"
+            cells[6].text = f"{r.get('bounced', 0):,}"
+            cells[7].text = f"{r.get('added_to_sub', 0):,}"
+            cells[8].text = f"{(r.get('open_rate') or 0):.1f}%"
+            cells[9].text = f"{(r.get('reply_rate') or 0):.1f}%"
 
-        doc.add_paragraph()
-        doc.add_heading("Subsequence Analytics", level=1)
-        tbl2 = doc.add_table(rows=1, cols=6)
-        tbl2.style = "Table Grid"
-        for i, h in enumerate(["Client", "Subsequence", "Total", "Opened", "Clicked", "Replied"]):
-            tbl2.rows[0].cells[i].text = h
-        for r in sub_data:
-            cells = tbl2.add_row().cells
-            cells[0].text = str(r.get("parent", ""))
-            cells[1].text = str(r.get("subsequence", ""))
-            cells[2].text = str(r.get("total", 0))
-            cells[3].text = str(r.get("opened", 0))
-            cells[4].text = str(r.get("clicked", 0))
-            cells[5].text = str(r.get("replied", 0))
+        # ── Subsequences (only those with leads, sorted by size) ─────
+        active_subs = [s for s in (sub_data or []) if (s.get("total") or 0) > 0]
+        active_subs.sort(key=lambda r: -(r.get("total") or 0))
+        if active_subs:
+            doc.add_heading(f"Subsequences ({len(active_subs)} active of {len(sub_data)})", level=1)
+            tbl2 = doc.add_table(rows=1, cols=7)
+            tbl2.style = "Light Grid Accent 1"
+            for i, hd in enumerate(["Subsequence", "Total", "Opened", "Clicked",
+                                    "Replied", "Open %", "Reply %"]):
+                tbl2.rows[0].cells[i].text = hd
+            for r in active_subs:
+                cells = tbl2.add_row().cells
+                cells[0].text = str(r.get("subsequence") or r.get("parent", ""))
+                cells[1].text = f"{r.get('total', 0):,}"
+                cells[2].text = f"{r.get('opened', 0):,}"
+                cells[3].text = f"{r.get('clicked', 0):,}"
+                cells[4].text = f"{r.get('replied', 0):,}"
+                cells[5].text = f"{(r.get('open_rate') or 0):.1f}%"
+                cells[6].text = f"{(r.get('reply_rate') or 0):.1f}%"
+
+        # ── Positive Leads ──────────────────────────────────────────
+        if pos_leads:
+            doc.add_heading(f"Positive Leads ({len(pos_leads)})", level=1)
+            tbl3 = doc.add_table(rows=1, cols=5)
+            tbl3.style = "Light Grid Accent 1"
+            for i, hd in enumerate(["Lead", "Email", "Category", "Reply Date", "Campaign"]):
+                tbl3.rows[0].cells[i].text = hd
+            for l in pos_leads[:200]:
+                cells = tbl3.add_row().cells
+                cells[0].text = str(l.get("name", ""))
+                cells[1].text = str(l.get("email", ""))
+                cells[2].text = str(l.get("category") or l.get("status", ""))
+                cells[3].text = str((l.get("reply_time") or l.get("last_activity") or ""))[:10]
+                cells[4].text = str(l.get("campaign") or l.get("source", ""))
 
         buf = io.BytesIO()
         doc.save(buf)
         buf.seek(0)
-        filename = f"analytics_{datetime.now().strftime('%Y%m%d')}.docx"
+        slug = (client_name or "all").lower().replace(" ", "_")
+        filename = f"{slug}_analytics_{datetime.now().strftime('%Y%m%d')}.docx"
         return send_file(
             buf,
             mimetype="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -617,19 +922,29 @@ def api_share_email():
                 "error": "SMTP not configured — add SMTP_HOST, SMTP_USER, SMTP_PASS to .env",
             }), 400
 
-        cache       = EMAIL_CACHE.get("data") or {}
         # Accept per-client filtered data via body, fall back to full cache
-        parent_data = body.get("parent_analytics", cache.get("parent_analytics", []))
-        sub_data    = body.get("sub_analytics",    cache.get("sub_analytics",    []))
-        client_lbl  = body.get("client", "")
-        pdf_bytes   = _build_report_pdf(parent_data, sub_data).read()
+        parent_data, sub_data, client_name, summary, pos_leads = _extract_export_args(body)
+        client_lbl  = client_name or ""
+        pdf_bytes   = _build_report_pdf(parent_data, sub_data,
+                                        client_name=client_name,
+                                        summary=summary,
+                                        positive_leads=pos_leads).read()
 
         msg            = MIMEMultipart()
         msg["From"]    = smtp_from
         msg["To"]      = to_email
         subj_tag       = f" — {client_lbl}" if client_lbl else ""
         msg["Subject"] = f"Smartlead Analytics Report{subj_tag} — {datetime.now().strftime('%Y-%m-%d')}"
-        msg.attach(MIMEText("Please find the analytics report attached.", "plain"))
+        # Email body opens with the same exec-summary paragraph that's in the PDF
+        body_text = (
+            (f"Hi,\n\nAttached is the {client_lbl} client dashboard report.\n\n"
+             if client_lbl else "Hi,\n\nAttached is the Smartlead analytics report.\n\n")
+            + "EXECUTIVE SUMMARY\n"
+            + _build_summary_paragraph(client_name, summary, parent_data, sub_data, pos_leads)
+            + "\n\nFull breakdown — campaigns, subsequences, positive leads — is in the attached PDF.\n\n"
+            + "— Sent from Unified Analytics Dashboard"
+        )
+        msg.attach(MIMEText(body_text, "plain"))
         fname = f"analytics_{datetime.now().strftime('%Y%m%d')}.pdf"
         part  = MIMEApplication(pdf_bytes, Name=fname)
         part["Content-Disposition"] = f'attachment; filename="{fname}"'
@@ -2908,9 +3223,11 @@ document.addEventListener("keydown", e=>{ if(e.key==="Escape"){ closeModal(); cl
 // ── Download / Share (per-client filtered) ─────────────────────
 function _getFilteredPayload(){
   return {
-    client: CLIENT,
+    client:           CLIENT,
     parent_analytics: DATA?.parent_campaigns || [],
-    sub_analytics:    DATA?.subsequences   || [],
+    sub_analytics:    DATA?.subsequences     || [],
+    summary:          DATA?.stats            || {},
+    positive_leads:   DATA?.positive_leads   || [],
   };
 }
 
