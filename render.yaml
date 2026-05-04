@@ -1,0 +1,34 @@
+services:
+  - type: web
+    name: smartlead-aimfox-unified
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn unified_dashboard:app --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 300
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.10
+      - key: SMARTLEAD_API_KEY
+        sync: false
+      - key: AIMFOX_API_KEY
+        sync: false
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_REFRESH_TOKEN
+        sync: false
+      - key: ZOHO_ACCOUNTS_URL
+        sync: false
+      - key: ZOHO_API_DOMAIN
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USER
+        sync: false
+      - key: SMTP_PASS
+        sync: false
+      - key: SMTP_FROM
+        sync: false

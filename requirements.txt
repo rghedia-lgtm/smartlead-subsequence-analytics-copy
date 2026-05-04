@@ -1,2 +1,6 @@
 requests
 python-dotenv
+flask>=3.0.0
+fpdf2
+python-docx
+gunicorn>=21.2.0

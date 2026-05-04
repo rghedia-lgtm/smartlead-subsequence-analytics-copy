@@ -4,6 +4,7 @@ import csv
 import json
 import re
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from collections import defaultdict
 from dotenv import load_dotenv
@@ -160,23 +161,33 @@ def build_messages_from_history(history):
     return messages
 
 
-def enrich_replied_leads(campaign_id, leads):
+def _enrich_one_lead(campaign_id, lead):
+    """Fetch and attach message history for a single replied lead."""
+    lead_id = get_lead_id(lead['email'])
+    if not lead_id:
+        return
+    history = get_lead_message_history(campaign_id, lead_id)
+    if history:
+        lead['messages'] = build_messages_from_history(history)
+
+
+def enrich_replied_leads(campaign_id, leads, max_workers=8):
     """
     For leads that have a reply_time, fetch full message history (incl. client reply).
-    Only these leads get the enriched thread; others keep the stats-based messages.
+    Uses a thread pool to parallelise API calls and finish much faster.
     """
     replied = [l for l in leads if l.get('reply_time')]
     if not replied:
         return leads
 
     log.info(f"    Enriching {len(replied)} replied lead(s) with message history...")
-    for lead in replied:
-        lead_id = get_lead_id(lead['email'])
-        if not lead_id:
-            continue
-        history = get_lead_message_history(campaign_id, lead_id)
-        if history:
-            lead['messages'] = build_messages_from_history(history)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_enrich_one_lead, campaign_id, lead): lead for lead in replied}
+        for fut in as_completed(futures):
+            try:
+                fut.result()
+            except Exception as e:
+                log.warning("    Enrichment error: %s", e)
     return leads
 
 
