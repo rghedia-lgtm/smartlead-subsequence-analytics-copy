@@ -32,15 +32,22 @@ logging.basicConfig(
 )
 log = logging.getLogger()
 
-# Client name mapping (keyword in campaign name → display name)
+# Client name mapping (keyword in campaign name → display name).
+# Order matters: more specific keywords first so they match before
+# generic ones (e.g. "KENDRA" before "USA" so a Kendra USA campaign
+# resolves to "Kendra" not the other way round — both map to "Kendra"
+# anyway, but for clarity the explicit name comes first).
 CLIENT_MAP = [
     ("FEAAM",       "FEAAM"),
     ("Wastestream", "Wastestream"),
-    ("KM",          "KM"),
     ("Stanford",    "Stanford G"),
+    ("STANDFORD",   "Stanford G"),  # common typo in campaign names
     ("Nexus",       "Nexus"),
     ("Henig",       "Henig"),
-    ("USA",         "Kendra"),
+    ("KENDRA",      "Kendra"),      # campaigns named "Kendra - ..."
+    ("USA",         "Kendra"),      # legacy: many Kendra campaigns are USA_*
+    ("K&M",         "KM"),
+    ("KM",          "KM"),
 ]
 
 # Lead categories that count as "positive"
