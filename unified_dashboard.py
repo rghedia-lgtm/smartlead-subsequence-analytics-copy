@@ -295,12 +295,23 @@ def _do_email_fetch():
                     log.warning("Parent fetch error: %s", e)
 
         result = {"parent_analytics": parent_data, "sub_analytics": sub_data}
-        EMAIL_CACHE.update({"data": result, "ts": now})
+        # ── Sanity guard against destructive overwrites ──────────────
+        # If Smartlead 429'd most of this fetch, parent_data will be a
+        # bunch of zero-total rows that would replace good prior data.
+        # Only overwrite cache if the new fetch has comparable data.
+        new_sent  = sum((p.get("total") or 0) for p in parent_data)
+        prev      = EMAIL_CACHE.get("data") or {}
+        prev_sent = sum((p.get("total") or 0) for p in prev.get("parent_analytics", []))
+        if prev_sent > 1000 and new_sent < prev_sent * 0.5:
+            log.warning("[guard] New fetch has only %d sent vs %d prior — "
+                        "likely rate-limited. Keeping old cache.",
+                        new_sent, prev_sent)
+        else:
+            EMAIL_CACHE.update({"data": result, "ts": now})
+            _db_save("email_cache", result)
+            log.info("Email data fetched in %.1fs (%d parents, %d subs, %d sent).",
+                     time.time() - now, len(parent_data), len(sub_data), new_sent)
         _email_progress = {"phase": "Done", "done": len(parents), "total": len(parents)}
-        log.info("Email data fetched in %.1fs (%d parents, %d subs).",
-                 time.time() - now, len(parent_data), len(sub_data))
-        # Persist to SQLite so we don't lose the cache on restart
-        _db_save("email_cache", result)
     finally:
         _email_fetching = False
 
