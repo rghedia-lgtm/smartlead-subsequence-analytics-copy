@@ -43,7 +43,9 @@ logging.basicConfig(level=logging.INFO,
 log = logging.getLogger(__name__)
 
 
-FETCH_WORKERS = 4
+# Smartlead rate limit is ~60 req/min; with retry-on-429 backoff we can
+# stay close to 2 workers without losing data. Tune via env var.
+FETCH_WORKERS = int(os.getenv("SYNC_WORKERS", "2"))
 OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            "data", "cache.json")
 

@@ -13,7 +13,7 @@ concurrency:
 jobs:
   sync:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 50    # plenty of headroom for rate-limited Smartlead fetches
     permissions:
       contents: write
 

@@ -90,6 +90,12 @@ def get_all_campaigns():
 
 
 def get_campaign_stats(campaign_id):
+    """Page through Smartlead campaign statistics with auto-retry on 429.
+
+    Smartlead's rate limit is roughly 60 req/min. Instead of bailing on a
+    429 (which the previous version did and gave us "0 sent" results),
+    we sleep with exponential backoff and retry. Up to 4 attempts per page.
+    """
     all_stats = []
     offset = 0
     limit = 100
@@ -98,20 +104,38 @@ def get_campaign_stats(campaign_id):
             f"{BASE_URL}/campaigns/{campaign_id}/statistics"
             f"?api_key={API_KEY}&limit={limit}&offset={offset}"
         )
-        try:
-            resp = SESSION.get(url, timeout=30)
+        attempt = 0
+        page_data = None
+        while attempt < 4:
+            try:
+                resp = SESSION.get(url, timeout=30)
+            except Exception as e:
+                log.warning(f"    Net err for {campaign_id} offset {offset} attempt {attempt+1}: {e}")
+                attempt += 1
+                time.sleep(3 * (attempt + 1))
+                continue
             if resp.status_code == 429:
-                log.warning(f"    Rate limited on campaign {campaign_id}, skipping.")
-                break
+                wait = 4 + attempt * 6   # 4, 10, 16, 22 sec
+                log.info(f"    429 on {campaign_id} offset {offset} — sleeping {wait}s (attempt {attempt+1}/4)")
+                time.sleep(wait)
+                attempt += 1
+                continue
             if not resp.content:
-                log.warning(f"    Empty response for campaign {campaign_id} at offset {offset}, stopping.")
+                log.warning(f"    Empty response for {campaign_id} offset {offset}; stopping page loop")
                 break
-            data = resp.json()
-        except Exception as e:
-            log.warning(f"    Failed to fetch stats for campaign {campaign_id} at offset {offset}: {e}")
+            try:
+                page_data = resp.json()
+                break
+            except Exception as e:
+                log.warning(f"    JSON decode err for {campaign_id} offset {offset}: {e}")
+                attempt += 1
+                time.sleep(2)
+        if page_data is None:
+            # gave up after 4 attempts
+            log.warning(f"    Skipping {campaign_id} offset {offset} after 4 retries")
             break
-        all_stats.extend(data.get("data", []))
-        total = int(data.get("total_stats", 0))
+        all_stats.extend(page_data.get("data", []))
+        total = int(page_data.get("total_stats", 0))
         offset += limit
         if offset >= total:
             break
