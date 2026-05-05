@@ -658,6 +658,80 @@ def _compute_date_range(parent_data, sub_data):
     return min(times), max(times)
 
 
+def _build_strategy_bullets(client_name, summary, parent_data, sub_data, pos_leads):
+    """Generate 4-6 actionable strategy bullets based on the actual numbers."""
+    label = client_name or "the campaign"
+    sent          = summary.get("sent", 0)
+    opened        = summary.get("opened", 0)
+    replied       = summary.get("replied", 0)
+    added_sub     = summary.get("added_to_sub", 0)
+    sub_total     = summary.get("sub_total", 0)
+    sub_opened    = summary.get("sub_opened", 0)
+    sub_replied   = summary.get("sub_replied", 0)
+    positive      = summary.get("positive", len(pos_leads or []))
+    bounced       = summary.get("bounced", 0)
+
+    open_rate     = (opened / sent * 100) if sent else 0
+    reply_rate    = (replied / sent * 100) if sent else 0
+    sub_open_rate = (sub_opened / sub_total * 100) if sub_total else 0
+    sub_reply_rate= (sub_replied / sub_total * 100) if sub_total else 0
+    bounce_rate   = (bounced / sent * 100) if sent else 0
+    pos_rate      = (positive / replied * 100) if replied else 0
+
+    bullets = []
+
+    # Open rate analysis
+    if open_rate >= 50:
+        bullets.append(f"Open rate is strong at {open_rate:.1f}% — subject lines and senders are working. "
+                       f"Maintain current cadence; test variants only on the bottom 10% of campaigns.")
+    elif open_rate >= 25:
+        bullets.append(f"Open rate of {open_rate:.1f}% is mid-range. A/B test 2-3 new subject lines on the "
+                       f"next batch and rotate sender warmup if it stays flat for 7+ days.")
+    elif sent > 0:
+        bullets.append(f"Open rate is low ({open_rate:.1f}%). Audit deliverability immediately — check SPF/DKIM/DMARC, "
+                       f"warm up new senders, and rewrite subject lines to be shorter/curiosity-driven.")
+
+    # Reply rate
+    if reply_rate >= 2:
+        bullets.append(f"Reply rate of {reply_rate:.2f}% is healthy. Tighten the qualification step so positive "
+                       f"replies (currently {positive}) get a calendar link within 2 hours.")
+    elif sent > 0:
+        bullets.append(f"Reply rate is only {reply_rate:.2f}%. The CTA in the first email needs work — "
+                       f"swap soft pitches for a single, specific question that's easy to answer.")
+
+    # Sub-sequence performance
+    if sub_total > 0:
+        if sub_open_rate >= 80:
+            bullets.append(f"Sub-sequence opens are excellent ({sub_open_rate:.1f}%). The opened-leads filter "
+                           f"is segmenting well — push more interested leads through this funnel.")
+        if sub_replied > 0:
+            bullets.append(f"Sub-sequence has driven {sub_replied} additional replies ({sub_reply_rate:.2f}%) "
+                           f"on top of the parent campaigns. Double down on the 2-3 subs with highest reply rates.")
+        else:
+            bullets.append(f"Sub-sequences are warming leads ({sub_open_rate:.1f}% open) but no replies yet. "
+                           f"Add a direct ask in sub-step 2 and consider shortening the gap from open → follow-up.")
+
+    # Bounce / list hygiene
+    if bounce_rate > 3 and sent > 0:
+        bullets.append(f"Bounce rate is {bounce_rate:.1f}% (>3% threshold) — clean the lead list with an email "
+                       f"verifier before next batch to protect sender reputation.")
+
+    # Positive replies / next action
+    if positive > 0:
+        bullets.append(f"{positive} positive repl{'ies' if positive != 1 else 'y'} identified ({pos_rate:.0f}% "
+                       f"of all replies). Sync them to Zoho CRM as Hot Leads today, and brief the SDR team on "
+                       f"the top 5 by company.")
+    elif replied > 0:
+        bullets.append(f"No positive replies detected in {replied} replies — review the categorization rules in "
+                       f"Smartlead. Some 'Information Request' / 'Meeting Request' may be miscategorised.")
+
+    if not bullets:
+        bullets.append(f"Insufficient data to generate strategy. Run the next batch of {label} campaigns and "
+                       f"refresh the dashboard in 24-48 hours.")
+
+    return bullets
+
+
 def _build_summary_paragraph(client_name, summary, parent_data, sub_data, pos_leads):
     """Generate a 2–3 sentence executive summary using the actual numbers."""
     label = client_name or "All Clients"
@@ -746,7 +820,6 @@ def _build_report_pdf(parent_data, sub_data, client_name=None,
     pdf.set_fill_color(238, 242, 255)
     pdf.set_draw_color(199, 210, 254)
     y = pdf.get_y()
-    # Reserve box height; multi_cell auto-wraps
     pdf.set_font("Helvetica", "B", 9)
     pdf.set_text_color(67, 56, 202)
     pdf.cell(0, 6, _safe_text("Executive Summary"), ln=True, fill=True, border="LTR")
@@ -757,26 +830,44 @@ def _build_report_pdf(parent_data, sub_data, client_name=None,
     pdf.set_text_color(0, 0, 0)
     pdf.ln(3)
 
-    # ── Summary cards (11 stats in a 4-col grid) ────────────────────
+    # ── Strategy & Recommendations ─────────────────────────────────
+    bullets = _build_strategy_bullets(client_name, summary, parent_data, sub_data, positive_leads)
+    pdf.set_fill_color(254, 243, 199)
+    pdf.set_draw_color(252, 211, 77)
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.set_text_color(146, 64, 14)
+    pdf.cell(0, 6, _safe_text("Strategy & Next Steps"), ln=True, fill=True, border="LTR")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(30, 41, 59)
+    for b in bullets:
+        pdf.set_x(pdf.l_margin)
+        pdf.multi_cell(0, 5, _safe_text(f"  - {b}"), border="LR", fill=True)
+    # Closing border
+    pdf.set_x(pdf.l_margin)
+    pdf.cell(0, 1, "", ln=True, fill=True, border="LBR")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(3)
+
+    # ── Summary cards (matches dashboard 9-card layout) ─────────────
     pdf.set_font("Helvetica", "B", 12)
     pdf.cell(0, 8, _safe_text("Summary Overview"), ln=True)
     pdf.ln(1)
 
     cards = [
-        ("Sent",          summary.get("sent", 0),         None),
-        ("Opened",        summary.get("opened", 0),       _pct(summary.get("opened", 0),  summary.get("sent", 0))),
-        ("Clicked",       summary.get("clicked", 0),      _pct(summary.get("clicked", 0), summary.get("sent", 0))),
-        ("Replied",       summary.get("replied", 0),      _pct(summary.get("replied", 0), summary.get("sent", 0))),
-        ("Added to Sub",  summary.get("added_to_sub", 0), _pct(summary.get("added_to_sub", 0), summary.get("sent", 0))),
-        ("Sub Opened",    summary.get("sub_opened", 0),   _pct(summary.get("sub_opened", 0),   summary.get("sub_total", 0))),
-        ("Sub Clicked",   summary.get("sub_clicked", 0),  _pct(summary.get("sub_clicked", 0),  summary.get("sub_total", 0))),
-        ("Sub Replied",   summary.get("sub_replied", 0),  _pct(summary.get("sub_replied", 0),  summary.get("sub_total", 0))),
-        ("Positive Replies", summary.get("positive", 0),  None),
-        ("Bounced",       summary.get("bounced", 0),      None),
-        ("Unsubscribed",  summary.get("unsubscribed", 0), None),
+        # Parent
+        ("Parent Sent",          summary.get("sent", 0),         None),
+        ("Parent Opened",        summary.get("opened", 0),       _pct(summary.get("opened", 0),  summary.get("sent", 0))),
+        ("Parent Replied",       summary.get("replied", 0),      _pct(summary.get("replied", 0), summary.get("sent", 0))),
+        ("Parent Positive Replied", summary.get("positive", 0),  _pct(summary.get("positive", 0), summary.get("replied", 0))),
+        # Sub
+        ("Sub Sent",             summary.get("sub_total", 0),    None),
+        ("Sub Opened",           summary.get("sub_opened", 0),   _pct(summary.get("sub_opened", 0),   summary.get("sub_total", 0))),
+        ("Sub Clicked",          summary.get("sub_clicked", 0),  _pct(summary.get("sub_clicked", 0),  summary.get("sub_total", 0))),
+        ("Sub Replied",          summary.get("sub_replied", 0),  _pct(summary.get("sub_replied", 0),  summary.get("sub_total", 0))),
+        ("Sub Positive Replied", summary.get("sub_positive", 0), _pct(summary.get("sub_positive", 0), summary.get("sub_replied", 0))),
     ]
-    card_w, card_h = 45, 18
-    cols = 4
+    card_w, card_h = 60, 18
+    cols = 3
     for i, (lbl, val, sub) in enumerate(cards):
         if i and i % cols == 0:
             pdf.ln(card_h + 1)
@@ -1040,24 +1131,31 @@ def api_export_docx():
         )
         para.runs[0].font.size = Pt(11)
 
-        # ── Summary ─────────────────────────────────────────────────
+        # ── Strategy & Next Steps ────────────────────────────────────
+        doc.add_heading("Strategy & Next Steps", level=1)
+        for b in _build_strategy_bullets(client_name, summary, parent_data, sub_data, pos_leads):
+            p = doc.add_paragraph(b, style="List Bullet")
+            for r in p.runs:
+                r.font.size = Pt(11)
+
+        # ── Summary (9-card layout matching dashboard) ──────────────
         doc.add_heading("Summary Overview", level=1)
         sum_tbl = doc.add_table(rows=1, cols=3)
         sum_tbl.style = "Light Grid Accent 1"
         for i, h in enumerate(["Metric", "Value", "Rate"]):
             sum_tbl.rows[0].cells[i].text = h
         rows = [
-            ("Sent",          summary.get("sent", 0),         "—"),
-            ("Opened",        summary.get("opened", 0),       _pct(summary.get("opened", 0),       summary.get("sent", 0))),
-            ("Clicked",       summary.get("clicked", 0),      _pct(summary.get("clicked", 0),      summary.get("sent", 0))),
-            ("Replied",       summary.get("replied", 0),      _pct(summary.get("replied", 0),      summary.get("sent", 0))),
-            ("Added to Sub",  summary.get("added_to_sub", 0), _pct(summary.get("added_to_sub", 0), summary.get("sent", 0))),
-            ("Sub Opened",    summary.get("sub_opened", 0),   _pct(summary.get("sub_opened", 0),   summary.get("sub_total", 0))),
-            ("Sub Clicked",   summary.get("sub_clicked", 0),  _pct(summary.get("sub_clicked", 0),  summary.get("sub_total", 0))),
-            ("Sub Replied",   summary.get("sub_replied", 0),  _pct(summary.get("sub_replied", 0),  summary.get("sub_total", 0))),
-            ("Positive Replies", summary.get("positive", 0),  "—"),
-            ("Bounced",       summary.get("bounced", 0),      "—"),
-            ("Unsubscribed",  summary.get("unsubscribed", 0), "—"),
+            # Parent
+            ("Parent Sent",             summary.get("sent", 0),         "—"),
+            ("Parent Opened",           summary.get("opened", 0),       _pct(summary.get("opened", 0),       summary.get("sent", 0))),
+            ("Parent Replied",          summary.get("replied", 0),      _pct(summary.get("replied", 0),      summary.get("sent", 0))),
+            ("Parent Positive Replied", summary.get("positive", 0),     _pct(summary.get("positive", 0),     summary.get("replied", 0))),
+            # Sub
+            ("Sub Sent",                summary.get("sub_total", 0),    "—"),
+            ("Sub Opened",              summary.get("sub_opened", 0),   _pct(summary.get("sub_opened", 0),   summary.get("sub_total", 0))),
+            ("Sub Clicked",             summary.get("sub_clicked", 0),  _pct(summary.get("sub_clicked", 0),  summary.get("sub_total", 0))),
+            ("Sub Replied",             summary.get("sub_replied", 0),  _pct(summary.get("sub_replied", 0),  summary.get("sub_total", 0))),
+            ("Sub Positive Replied",    summary.get("sub_positive", 0), _pct(summary.get("sub_positive", 0), summary.get("sub_replied", 0))),
         ]
         for lbl, val, rate in rows:
             cells = sum_tbl.add_row().cells
