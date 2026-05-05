@@ -60,26 +60,39 @@ MAX_MSGS_PER_LEAD  = 8
 
 
 def slim_lead(lead):
-    """Drop bulky/unused fields from a Smartlead lead so the cache fits."""
+    """Drop bulky/unused fields. Normalise message direction so the
+    chat-thread renderer can color-code sent vs received.
+    Smartlead emits {is_reply, sent_time, body, subject}; AimFox emits
+    {type, from, time, body}. Output is unified: {type, from, subject,
+    time, body}."""
     msgs = lead.get("messages") or []
+    lead_email = lead.get("email", "")
+    lead_name  = lead.get("name") or lead_email or "Unknown"
+
+    def _slim_msg(m):
+        is_reply = m.get("is_reply")
+        if is_reply is None:
+            t = (m.get("type") or m.get("direction") or "").lower()
+            is_reply = t in ("inbound", "received", "reply", "replied")
+        return {
+            "type":    "inbound" if is_reply else "outbound",
+            "from":    (m.get("from") or (lead_name if is_reply else "Us"))[:80],
+            "subject": (m.get("subject") or "")[:200],
+            "time":    (m.get("time") or m.get("sent_time")
+                        or m.get("received_at") or "")[:19],
+            "body":    (m.get("body") or "")[:MAX_MSG_BODY_CHARS],
+        }
+
     return {
-        "name":      lead.get("name") or lead.get("email") or "Unknown",
-        "email":     lead.get("email", ""),
+        "name":      lead_name,
+        "email":     lead_email,
         "category":  lead.get("category", ""),
         "company":   lead.get("company", ""),
         "sent_time":  (lead.get("sent_time")  or "")[:19],
         "open_time":  (lead.get("open_time")  or "")[:19],
         "click_time": (lead.get("click_time") or "")[:19],
         "reply_time": (lead.get("reply_time") or "")[:19],
-        "messages": [
-            {
-                "from": (m.get("from") or "")[:80],
-                "type": (m.get("type") or "")[:30],
-                "time": (m.get("time") or "")[:19],
-                "body": (m.get("body") or "")[:MAX_MSG_BODY_CHARS],
-            }
-            for m in msgs[:MAX_MSGS_PER_LEAD]
-        ],
+        "messages": [_slim_msg(m) for m in msgs[:MAX_MSGS_PER_LEAD]],
     }
 
 

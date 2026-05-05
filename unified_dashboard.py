@@ -1533,25 +1533,43 @@ def api_client(slug):
                 for sep in [" |", "  ", " - "]:
                     if sep in company:
                         company = company.split(sep, 1)[0].strip()
-                msgs = cv.get("_messages") or cv.get("messages") or []
+                msgs_raw = cv.get("_messages") or cv.get("messages") or []
                 last_msg_time = ""
-                if msgs:
+                if msgs_raw:
                     last_msg_time = max(
                         str(m.get("created_at") or m.get("date") or "")
-                        for m in msgs
+                        for m in msgs_raw
                     )[:19]
                 connected = cv.get("connected", False)
                 unread    = cv.get("unread_count", cv.get("unread", 0)) or 0
+                # Slim the message bodies to keep the response light, but
+                # preserve direction so the chat renderer can color-code
+                # sent vs received.
+                cv_owner_name = cv.get("owner_name") or acc_map.get(cv_owner, cv_owner) or ""
+                slim_msgs = []
+                for m in msgs_raw[:25]:
+                    sender_obj = m.get("sender")
+                    sender_name = (sender_obj.get("full_name", "")
+                                   if isinstance(sender_obj, dict) else
+                                   (sender_obj or ""))
+                    is_outbound = (sender_name == cv_owner_name) or m.get("automated")
+                    slim_msgs.append({
+                        "type":  "outbound" if is_outbound else "inbound",
+                        "from":  (sender_name or (cv_owner_name if is_outbound else lead_name))[:80],
+                        "time":  str(m.get("created_at") or m.get("date") or "")[:19],
+                        "body":  (m.get("body") or "")[:600],
+                    })
                 conv_row = {
                     "lead":       lead_name,
                     "occupation": occ,
                     "company":    company,
                     "campaign":   cv_camp_name,
-                    "owner":      cv.get("owner_name") or acc_map.get(cv_owner, cv_owner) or "",
-                    "msgs":       len(msgs),
+                    "owner":      cv_owner_name,
+                    "msgs":       len(msgs_raw),
                     "unread":     unread,
                     "connected":  bool(connected) and str(connected).lower() != "false",
                     "last":       last_msg_time,
+                    "messages":   slim_msgs,
                 }
                 li_convos.append(conv_row)
                 if company:
@@ -3660,9 +3678,14 @@ function renderLIStats(){
      sub:`${s.reply_rate||0}%`,
      leads:()=>leadEvents.filter(e=>e.transition==="reply").map(e=>({name:e.lead, email:e.occupation, _campaign:e.campaign, sent_time:e.date}))},
     {key:"li_convs",     lbl:"Conversations",   val: s.conversations||0, icon:"💭", col:"c-cyan",
-     leads:()=>convs.map(c=>({name:c.lead, email:c.occupation, _campaign:c.campaign, reply_time:c.last}))},
+     leads:()=>convs.map(c=>({name:c.lead, email:c.occupation, _campaign:c.campaign,
+                              reply_time:c.last, messages:c.messages || [],
+                              category:c.connected?"Connected":""}))},
     {key:"li_active",    lbl:"Active Convos",   val: s.active_conversations||0, icon:"🔥", col:"c-orange",
-     leads:()=>convs.filter(c=>c.connected && c.msgs>0).map(c=>({name:c.lead, email:c.occupation, _campaign:c.campaign, reply_time:c.last}))},
+     leads:()=>convs.filter(c=>c.connected && c.msgs>0).map(c=>({
+        name:c.lead, email:c.occupation, _campaign:c.campaign,
+        reply_time:c.last, messages:c.messages || [],
+        category:"Active"}))},
     {key:"li_companies", lbl:"Companies in Convo", val: s.unique_companies||0, icon:"🏢", col:"c-rose",
      leads:()=>companies.map(c=>({name:c.name, email:`${c.conversations} convo${c.conversations!==1?'s':''}`, _campaign:(c.leads||[]).slice(0,3).join(", "), reply_time:c.last_msg}))},
   ];
