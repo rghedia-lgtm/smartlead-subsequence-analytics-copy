@@ -5,6 +5,14 @@ import json
 import re
 import time
 import logging
+
+# Shared session with browser-like User-Agent so the Smartlead WAF doesn't
+# silently swallow requests from cloud IPs (Render Frankfurt, etc).
+SESSION = requests.Session()
+SESSION.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; KendraAnalyticsBot/1.0; +https://smartlead-aimfox-combined-dashboard.onrender.com)",
+    "Accept": "application/json",
+})
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from collections import defaultdict
@@ -55,7 +63,7 @@ def get_all_campaigns():
     last_err = None
     for attempt in range(3):
         try:
-            response = requests.get(
+            response = SESSION.get(
                 f"{BASE_URL}/campaigns?api_key={API_KEY}",
                 timeout=30,  # don't hang forever if Smartlead is slow
             )
@@ -84,7 +92,7 @@ def get_campaign_stats(campaign_id):
             f"?api_key={API_KEY}&limit={limit}&offset={offset}"
         )
         try:
-            resp = requests.get(url, timeout=30)
+            resp = SESSION.get(url, timeout=30)
             if resp.status_code == 429:
                 log.warning(f"    Rate limited on campaign {campaign_id}, skipping.")
                 break
@@ -112,7 +120,7 @@ def get_lead_id(email):
     if email in _lead_id_cache:
         return _lead_id_cache[email]
     try:
-        resp = requests.get(f"{BASE_URL}/leads/?api_key={API_KEY}&email={email}", timeout=15)
+        resp = SESSION.get(f"{BASE_URL}/leads/?api_key={API_KEY}&email={email}", timeout=15)
         if resp.status_code == 200 and resp.content:
             data = resp.json()
             if isinstance(data, list) and data:
@@ -134,7 +142,7 @@ def get_lead_message_history(campaign_id, lead_id):
             f"{BASE_URL}/campaigns/{campaign_id}/leads/{lead_id}/message-history"
             f"?api_key={API_KEY}&show_plain_text_response=true"
         )
-        resp = requests.get(url, timeout=30)
+        resp = SESSION.get(url, timeout=30)
         if resp.status_code == 200 and resp.content:
             data = resp.json()
             history = data.get('history') or data.get('list') or data.get('messages') or data.get('data') or []
