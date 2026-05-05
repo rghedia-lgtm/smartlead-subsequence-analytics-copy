@@ -3291,6 +3291,16 @@ tbody tr:hover td{background:#fafbff}
 .lead-msg{background:#f8fafc;border-left:3px solid #6366f1;padding:8px 12px;border-radius:0 6px 6px 0;margin-top:8px;font-size:12px;color:#334155;white-space:pre-wrap}
 .lead-msg .mhdr{font-size:10px;color:#94a3b8;font-weight:700;margin-bottom:4px;text-transform:uppercase;letter-spacing:.5px}
 
+/* Chat-bubble layout for email threads */
+.chat-thread{padding:6px 0;display:flex;flex-direction:column;gap:10px}
+.chat-bubble{max-width:72%;padding:9px 13px;border-radius:14px;font-size:12px;line-height:1.45;white-space:pre-wrap;word-break:break-word;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+.chat-bubble .chdr{font-size:10px;font-weight:700;margin-bottom:5px;display:flex;justify-content:space-between;gap:10px;opacity:.75}
+.chat-out{align-self:flex-end;background:linear-gradient(135deg,#4f46e5 0%,#6366f1 100%);color:#fff;border-bottom-right-radius:4px}
+.chat-out .chdr{color:#e0e7ff}
+.chat-in{align-self:flex-start;background:#f1f5f9;color:#1e293b;border:1px solid #e2e8f0;border-bottom-left-radius:4px}
+.chat-in .chdr{color:#64748b}
+.chat-empty{color:#94a3b8;font-size:12px;text-align:center;padding:20px}
+
 .banner{background:#fef9c3;border:1px solid #fde047;border-radius:8px;padding:10px 16px;margin-bottom:14px;font-size:13px;color:#78350f;display:none;align-items:center;gap:10px}
 .banner.show{display:flex}
 </style>
@@ -3867,19 +3877,45 @@ function renderPositive(){
   </tr>`).join("")}
   </tbody></table>`;
 }
+// Render a list of email messages as chat bubbles.
+// Outbound (sent by us) → right side, indigo. Inbound (replies) → left, gray.
+function renderChatThread(messages){
+  if(!messages || !messages.length){
+    return '<div class="chat-empty">No messages stored for this lead.<br><span style="font-size:10px">Sub-sequence and non-positive leads have message bodies trimmed in the cache to keep the file small.</span></div>';
+  }
+  // Sort by time so the conversation reads top→bottom chronologically
+  const sorted = messages.slice().sort((a,b)=>{
+    const ta = (a.time||""), tb = (b.time||"");
+    return ta < tb ? -1 : ta > tb ? 1 : 0;
+  });
+  const isInbound = m => {
+    const t = (m.type||"").toLowerCase();
+    return t === "inbound" || t === "received" || t === "reply" || t === "replied";
+  };
+  return `<div class="chat-thread">${sorted.map(m=>{
+    const cls   = isInbound(m) ? "chat-in"  : "chat-out";
+    const label = isInbound(m) ? "Received" : "Sent";
+    const from  = m.from ? escapeHtml(m.from) : "";
+    const time  = m.time ? escapeHtml(m.time.replace("T", " ").slice(0,16)) : "";
+    return `<div class="chat-bubble ${cls}">
+      <div class="chdr">
+        <span>${label}${from?" · "+from:""}</span>
+        <span>${time}</span>
+      </div>
+      ${escapeHtml(m.body||"").replace(/\n/g,"<br>")}
+    </div>`;
+  }).join("")}</div>`;
+}
+
 function openConvo(i){
   const l = (DATA.positive_leads||[])[i]; if(!l) return;
-  const msgs = (l.messages||[]);
-  const body = msgs.length
-    ? msgs.map(m=>`<div class="lead-msg"><div class="mhdr">${escapeHtml(m.type||"")} · ${escapeHtml(m.from||"")} · ${escapeHtml(m.time||"")}</div>${escapeHtml(m.body||"")}</div>`).join("")
-    : `<div class="no-data">No conversation messages stored.</div>`;
   document.getElementById("modal-title").textContent = `Conversation — ${l.name}`;
   document.getElementById("modal-body").innerHTML = `
     <div class="lead-row">
       <div class="lead-name">${escapeHtml(l.name||"")}</div>
       <div class="lead-meta">${escapeHtml(l.email||"")} · ${escapeHtml(l.campaign||"")} · <span class="badge b-pos">${escapeHtml(l.category||"")}</span></div>
     </div>
-    ${body}`;
+    ${renderChatThread(l.messages || [])}`;
   document.getElementById("modal-ovl").classList.add("show");
 }
 
@@ -3984,19 +4020,41 @@ function openLeadModal(title, leads){
   if(!leads.length){
     document.getElementById("modal-body").innerHTML = '<div class="no-data">No leads to show.</div>';
   } else {
-    document.getElementById("modal-body").innerHTML = leads.slice(0, 200).map(l=>{
-      const msgs = (l.messages||[]).slice(0,3).map(m=>
-        `<div class="lead-msg"><div class="mhdr">${escapeHtml(m.type||"")} · ${escapeHtml(m.time||"")}</div>${escapeHtml((m.body||"").slice(0,300))}</div>`
-      ).join("");
+    // Each lead row is collapsed; click name to expand chat thread
+    const rows = leads.slice(0, 200).map((l,idx)=>{
       const cat = l.category ? `<span class="badge ${POSITIVE.has((l.category||"").toLowerCase())?'b-pos':'b-info'}">${escapeHtml(l.category)}</span>` : "";
-      return `<div class="lead-row">
+      const events = [];
+      if(l.sent_time)  events.push(`sent ${escapeHtml(l.sent_time.slice(0,10))}`);
+      if(l.open_time)  events.push(`opened ${escapeHtml(l.open_time.slice(0,10))}`);
+      if(l.click_time) events.push(`clicked ${escapeHtml(l.click_time.slice(0,10))}`);
+      if(l.reply_time) events.push(`replied ${escapeHtml(l.reply_time.slice(0,10))}`);
+      const hasMsgs = (l.messages||[]).length > 0;
+      const toggle = hasMsgs
+        ? `<span class="clickable" onclick="toggleLeadThread(${idx})">View ${(l.messages||[]).length} msgs ▼</span>`
+        : "";
+      return `<div class="lead-row" id="ld-${idx}">
         <div class="lead-name">${escapeHtml(l.name||l.email||"Unknown")} ${cat}</div>
-        <div class="lead-meta">${escapeHtml(l.email||"")} · ${escapeHtml(l._campaign||l.campaign||"")} · ${l.reply_time?`replied ${escapeHtml(l.reply_time.slice(0,10))}`:l.open_time?`opened ${escapeHtml(l.open_time.slice(0,10))}`:""}</div>
-        ${msgs}
+        <div class="lead-meta">${escapeHtml(l.email||"")} · ${escapeHtml(l._campaign||l.campaign||"")} · ${events.join(" · ")} ${hasMsgs?"· "+toggle:""}</div>
+        <div id="ld-${idx}-thread" style="display:none;margin-top:8px"></div>
       </div>`;
-    }).join("") + (leads.length>200?`<div class="no-data">Showing first 200 of ${leads.length}</div>`:"");
+    }).join("");
+    document.getElementById("modal-body").innerHTML = rows + (leads.length>200?`<div class="no-data">Showing first 200 of ${leads.length}</div>`:"");
+    // Stash the leads on the modal so toggleLeadThread can find them
+    window.__currentModalLeads = leads;
   }
   document.getElementById("modal-ovl").classList.add("show");
+}
+
+function toggleLeadThread(idx){
+  const el = document.getElementById(`ld-${idx}-thread`);
+  if(!el) return;
+  if(el.style.display === "none"){
+    const lead = (window.__currentModalLeads || [])[idx];
+    el.innerHTML = renderChatThread(lead?.messages || []);
+    el.style.display = "block";
+  } else {
+    el.style.display = "none";
+  }
 }
 function closeModal(){document.getElementById("modal-ovl").classList.remove("show")}
 function escapeHtml(s){return String(s||"").replace(/[&<>"']/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
