@@ -185,25 +185,70 @@ def get_lead_message_history(campaign_id, lead_id):
     return []
 
 
-def build_messages_from_history(history):
-    """Convert raw message-history list into normalised message dicts."""
+def build_messages_from_history(history, lead_email=None):
+    """Convert raw message-history list into normalised message dicts.
+
+    Direction detection (option A — defensive):
+      1. Explicit type/direction field — 'reply' / 'inbound' / 'received'
+      2. Smartlead's 'message_type' field — 'REPLY' / 'SENT'
+      3. Smartlead's 'is_replied' / 'is_inbound' boolean flags
+      4. Email comparison: if from_email == lead_email, it's an inbound reply
+      5. Default: outbound (we sent it)
+    """
     messages = []
+    lead_email_norm = (lead_email or '').strip().lower()
+
     for item in history:
-        # Direction: outbound = we sent it, inbound = reply from lead
-        direction = (item.get('type') or item.get('direction') or 'outbound').lower()
-        is_reply  = direction in ('inbound', 'received', 'reply')
+        # ── Determine direction ────────────────────────────────────
+        is_reply = False
+
+        # Path 1: explicit type/direction
+        d = (item.get('type') or item.get('direction')
+             or item.get('message_type') or '').lower()
+        if d in ('inbound', 'received', 'reply', 'replied'):
+            is_reply = True
+
+        # Path 2: boolean flags Smartlead sometimes sends
+        if not is_reply:
+            for flag in ('is_replied', 'is_reply', 'is_inbound', 'is_received'):
+                v = item.get(flag)
+                if v is True or (isinstance(v, str) and v.lower() in ('true', '1', 'yes')):
+                    is_reply = True
+                    break
+
+        # Path 3: email-address comparison against the lead
+        from_email = (item.get('from') or item.get('from_email')
+                      or item.get('sender_email') or item.get('email_from')
+                      or item.get('reply_email') or '').strip().lower()
+        if not is_reply and lead_email_norm and from_email and from_email == lead_email_norm:
+            is_reply = True
+
+        # Path 4: extract email out of "Name <email@...>" patterns
+        if not is_reply and lead_email_norm:
+            sender_field = item.get('sender') or item.get('from_name') or ''
+            if isinstance(sender_field, str):
+                m = re.search(r'<([^>]+)>', sender_field)
+                if m and m.group(1).strip().lower() == lead_email_norm:
+                    is_reply = True
 
         subject   = item.get('subject', '') or ''
-        body_html = item.get('email_body') or item.get('message') or item.get('body') or ''
+        body_html = (item.get('email_body') or item.get('message')
+                     or item.get('body') or item.get('reply_message')
+                     or item.get('email_message') or '')
         body      = strip_html(body_html)[:3000]
-        sent_time = (item.get('time') or item.get('sent_at') or
-                     item.get('received_at') or item.get('created_at') or '')
+        sent_time = (item.get('time') or item.get('sent_at')
+                     or item.get('received_at') or item.get('created_at')
+                     or item.get('reply_time') or item.get('replied_at') or '')
         seq       = item.get('seq_number') or item.get('sequence_number') or 0
 
         # Engagement on outbound messages
         stats     = item.get('stats') or {}
         open_time = stats.get('open_time') or item.get('open_time') or ''
         click_time= stats.get('click_time') or item.get('click_time') or ''
+
+        # 'from' display name
+        from_name = (item.get('from_name') or item.get('sender_name')
+                     or (from_email or ('Lead' if is_reply else 'Us')))
 
         messages.append({
             'seq':       seq,
@@ -212,7 +257,8 @@ def build_messages_from_history(history):
             'sent_time': sent_time,
             'open_time': open_time,
             'click_time':click_time,
-            'is_reply':  is_reply,   # True = inbound reply from lead
+            'is_reply':  is_reply,
+            'from':      from_name,
         })
 
     messages.sort(key=lambda x: (x.get('sent_time', ''), x.get('seq', 0)))
@@ -226,7 +272,8 @@ def _enrich_one_lead(campaign_id, lead):
         return
     history = get_lead_message_history(campaign_id, lead_id)
     if history:
-        lead['messages'] = build_messages_from_history(history)
+        lead['messages'] = build_messages_from_history(history,
+                                                       lead_email=lead.get('email'))
 
 
 def enrich_replied_leads(campaign_id, leads, max_workers=8):
