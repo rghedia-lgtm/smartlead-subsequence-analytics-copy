@@ -346,45 +346,50 @@ GITHUB_CACHE_URL = os.getenv(
 )
 
 
+LOCAL_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "data", "cache.json.gz")
+
+
+def _load_local_cache_file():
+    """Read data/cache.json.gz that ships with the deploy (committed to main).
+    Avoids any network call. Used as the fast path on dashboard startup."""
+    if not os.path.exists(LOCAL_CACHE_FILE):
+        return None
+    try:
+        import gzip
+        with gzip.open(LOCAL_CACHE_FILE, "rb") as gz:
+            return json.loads(gz.read().decode("utf-8"))
+    except Exception as e:
+        log.warning("[local-cache] load failed: %s", e)
+        return None
+
+
 def _fetch_remote_cache():
-    """Pull the latest cache.json.gz from the data-cache branch on GitHub
-    and decompress it. (Raw uncompressed JSON is too large for GitHub's
-    100 MB single-file limit, hence the gzip step.)
-
-    Repo is private, so we need to authenticate. Two paths:
-      1. raw.githubusercontent.com with `Authorization: Bearer <PAT>`
-      2. api.github.com/repos/.../contents/... with same Bearer header
-
-    We try (1) first since it's a single hop; fall back to (2) if needed.
-    The token comes from the GITHUB_CACHE_TOKEN env var.
-    """
+    """Read cache.json.gz. Tries in order:
+      1. Local file shipped with the deploy (data/cache.json.gz on disk)
+      2. GitHub raw URL (data-cache branch — populated by the cron job)
+    The local file is instant; the GitHub URL is a fallback for when the
+    Actions cron has pushed newer data than the deploy contains."""
     import gzip, io
+
+    # ── Path 1: local file (fast, no network) ────────────────────
+    local = _load_local_cache_file()
+    if local:
+        log.info("[cache] Loaded from local data/cache.json.gz")
+        return local
+
+    # ── Path 2: GitHub raw URL ───────────────────────────────────
     headers = {"Cache-Control": "no-cache"}
     token = os.getenv("GITHUB_CACHE_TOKEN") or os.getenv("GITHUB_TOKEN")
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
         log.info("[remote] Fetching cache from %s", GITHUB_CACHE_URL)
-        r = requests.get(GITHUB_CACHE_URL, timeout=60, headers=headers)
-        if r.status_code == 404 and token:
-            # Private repo raw URLs sometimes 404 even with auth; fall back
-            # to the contents API which always works for read-token PATs.
-            api_url = (
-                "https://api.github.com/repos/"
-                "rghedia-lgtm/smartlead-subsequence-analytics-copy/"
-                "contents/data/cache.json.gz?ref=data-cache"
-            )
-            log.info("[remote] raw URL 404 — trying contents API: %s", api_url)
-            api_r = requests.get(api_url, timeout=30, headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github.v3.raw",
-            })
-            api_r.raise_for_status()
-            content = api_r.content
-        else:
-            r.raise_for_status()
-            content = r.content
-        # Decompress if .gz
+        # Tight (connect, read) timeouts so a hang fails fast and we keep
+        # the dashboard responsive even when GitHub is unreachable.
+        r = requests.get(GITHUB_CACHE_URL, timeout=(10, 20), headers=headers)
+        r.raise_for_status()
+        content = r.content
         if GITHUB_CACHE_URL.endswith(".gz") or content[:2] == b"\x1f\x8b":
             with gzip.open(io.BytesIO(content), "rb") as gz:
                 return json.loads(gz.read().decode("utf-8"))
