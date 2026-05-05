@@ -2808,6 +2808,21 @@ tbody tr:hover td{background:#fafbff}
 
   <div class="banner" id="banner">⏳ <span id="banner-msg">Loading…</span></div>
 
+  <!-- ─── Date Filter ───────────────────────────────────────────── -->
+  <div class="filter-bar" style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:12px 18px;margin-bottom:16px;display:flex;align-items:center;gap:10px;flex-wrap:wrap;box-shadow:0 1px 6px rgba(0,0,0,.05)">
+    <span style="font-size:10px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:1px">Date Range</span>
+    <input type="date" id="df-from" style="border:1.5px solid #e2e8f0;border-radius:7px;padding:6px 10px;font-size:12px;background:#f8fafc;font-family:inherit;outline:none">
+    <span style="font-size:11px;color:#94a3b8">to</span>
+    <input type="date" id="df-to"   style="border:1.5px solid #e2e8f0;border-radius:7px;padding:6px 10px;font-size:12px;background:#f8fafc;font-family:inherit;outline:none">
+    <button onclick="applyDate()"     style="padding:6px 14px;background:#4f46e5;color:#fff;border:none;border-radius:7px;font-size:12px;font-weight:700;cursor:pointer">Apply</button>
+    <button onclick="presetDate('today')"     style="padding:6px 12px;background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer">Today</button>
+    <button onclick="presetDate('yesterday')" style="padding:6px 12px;background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer">Yesterday</button>
+    <button onclick="presetDate('last7')"     style="padding:6px 12px;background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer">Last 7 days</button>
+    <button onclick="presetDate('last30')"    style="padding:6px 12px;background:#eef2ff;color:#4338ca;border:1px solid #c7d2fe;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer">Last 30 days</button>
+    <button onclick="clearDate()"     style="padding:6px 12px;background:#f1f5f9;color:#64748b;border:1px solid #e2e8f0;border-radius:7px;font-size:11px;font-weight:700;cursor:pointer">Clear</button>
+    <span id="df-status" style="font-size:11px;color:#6366f1;font-weight:600;margin-left:auto"></span>
+  </div>
+
   <!-- ─── 1. Stats Overview ─────────────────────────────────────── -->
   <div class="section-label"><h2>📊 {{client.name}} — Overview</h2><span class="pill">click any card to drill into leads</span></div>
   <div class="grid-stats" id="stats-grid"></div>
@@ -2901,7 +2916,8 @@ tbody tr:hover td{background:#fafbff}
 <script>
 const SLUG = "{{client.slug}}";
 const CLIENT = "{{client.name}}";
-let DATA = null;
+let DATA = null;       // currently displayed (may be filtered)
+let DATA_FULL = null;  // unfiltered original from /api/client/<slug>
 let CHARTS = {};
 
 const POSITIVE = new Set(["interested","meeting booked","positive","meeting request","will buy","warm","demo request"]);
@@ -2916,6 +2932,7 @@ async function loadAll(force){
     const r = await fetch(`/api/client/${SLUG}${force?"?_=".concat(Date.now()):""}`);
     const d = await r.json();
     if(d.error) throw new Error(d.error);
+    DATA_FULL = d;
     DATA = d;
     if(d.loading){
       showBanner("⏳ Smartlead data still fetching in background — showing partial data…");
@@ -2923,10 +2940,131 @@ async function loadAll(force){
     } else {
       hideBanner();
     }
-    renderAll();
+    // Re-apply current date filter (if any) to fresh data
+    if(document.getElementById("df-from").value || document.getElementById("df-to").value){
+      applyDate(true);
+    } else {
+      renderAll();
+    }
   } catch(e){
     showBanner("Error: " + e.message);
   }
+}
+
+// ── Date filter helpers ──────────────────────────────────────────
+function _todayStr(d){ d = d || new Date(); return d.toISOString().slice(0,10); }
+function presetDate(kind){
+  const today = new Date();
+  let from, to;
+  if(kind==="today"){ from = to = _todayStr(today); }
+  else if(kind==="yesterday"){
+    const y = new Date(today); y.setDate(y.getDate()-1);
+    from = to = _todayStr(y);
+  }
+  else if(kind==="last7"){
+    const a = new Date(today); a.setDate(a.getDate()-6);
+    from = _todayStr(a); to = _todayStr(today);
+  }
+  else if(kind==="last30"){
+    const a = new Date(today); a.setDate(a.getDate()-29);
+    from = _todayStr(a); to = _todayStr(today);
+  }
+  document.getElementById("df-from").value = from;
+  document.getElementById("df-to").value   = to;
+  applyDate();
+}
+function clearDate(){
+  document.getElementById("df-from").value = "";
+  document.getElementById("df-to").value   = "";
+  document.getElementById("df-status").textContent = "";
+  DATA = DATA_FULL;
+  renderAll();
+}
+
+function applyDate(silent){
+  const from = document.getElementById("df-from").value;
+  const to   = document.getElementById("df-to").value;
+  if(!from && !to){ clearDate(); return; }
+  if(!DATA_FULL){ return; }
+  const lo = from ? from + "T00:00:00" : "0000-01-01";
+  const hi = to   ? to   + "T23:59:59" : "9999-12-31";
+
+  const inRange = ts => {
+    if(!ts) return false;
+    const t = String(ts).slice(0,19);
+    return t >= lo && t <= hi;
+  };
+  // A lead is "in range" if its sent_time falls in the window
+  // (campaigns where no leads were sent in window get total=0)
+  const filterCamp = (camp) => {
+    const leads = (camp.leads||[]).filter(l => inRange(l.sent_time));
+    const total = leads.length;
+    const opened       = leads.filter(l => inRange(l.open_time)).length;
+    const clicked      = leads.filter(l => inRange(l.click_time)).length;
+    const replied      = leads.filter(l => inRange(l.reply_time)).length;
+    const bounced      = leads.filter(l => (l.category||"").toLowerCase()==="bounced").length;
+    const unsubscribed = leads.filter(l => (l.category||"").toLowerCase()==="unsubscribed").length;
+    const added_to_sub = camp.added_to_sub_emails
+        ? leads.filter(l => (camp.added_to_sub_emails||[]).includes(l.email)).length
+        : leads.filter(l => l.added_to_sub).length;
+    return {
+      ...camp,
+      leads, total, opened, clicked, replied, bounced, unsubscribed, added_to_sub,
+      open_rate:  total ? +(opened/total*100).toFixed(1)  : 0,
+      reply_rate: total ? +(replied/total*100).toFixed(1) : 0,
+      click_rate: total ? +(clicked/total*100).toFixed(1) : 0,
+    };
+  };
+
+  const filtered = JSON.parse(JSON.stringify(DATA_FULL));
+  filtered.parent_campaigns = (DATA_FULL.parent_campaigns||[])
+      .map(filterCamp)
+      .filter(c => (c.total||0) > 0 || (c.leads||[]).length > 0);  // hide pure-zero rows
+  filtered.subsequences = (DATA_FULL.subsequences||[])
+      .map(filterCamp)
+      .filter(s => (s.total||0) > 0);
+
+  // Positive leads — keep those whose reply_time falls in window
+  const POS = new Set(["interested","meeting booked","positive","meeting request","will buy","warm","demo request"]);
+  filtered.positive_leads = [];
+  filtered.parent_campaigns.forEach(p=>{
+    (p.leads||[]).forEach(l=>{
+      if(POS.has((l.category||"").toLowerCase())){
+        filtered.positive_leads.push({
+          ...l,
+          name: l.name || l.email || "Unknown",
+          campaign: p.raw_name || p.client || "",
+          messages: l.messages || [],
+        });
+      }
+    });
+  });
+
+  // Recompute summary from filtered totals
+  const sum = (arr,k) => arr.reduce((a,r)=>a+(r[k]||0), 0);
+  filtered.stats = {
+    sent:         sum(filtered.parent_campaigns, "total"),
+    opened:       sum(filtered.parent_campaigns, "opened"),
+    clicked:      sum(filtered.parent_campaigns, "clicked"),
+    replied:      sum(filtered.parent_campaigns, "replied"),
+    bounced:      sum(filtered.parent_campaigns, "bounced"),
+    unsubscribed: sum(filtered.parent_campaigns, "unsubscribed"),
+    added_to_sub: sum(filtered.parent_campaigns, "added_to_sub"),
+    sub_total:    sum(filtered.subsequences,    "total"),
+    sub_opened:   sum(filtered.subsequences,    "opened"),
+    sub_clicked:  sum(filtered.subsequences,    "clicked"),
+    sub_replied:  sum(filtered.subsequences,    "replied"),
+    positive:     filtered.positive_leads.length,
+  };
+
+  DATA = filtered;
+  const lbl = (from && to && from === to) ? from
+            : (from && to)               ? `${from} to ${to}`
+            : (from)                     ? `from ${from}`
+            : `until ${to}`;
+  document.getElementById("df-status").textContent =
+      `Filtered ${lbl} • ${filtered.parent_campaigns.length} campaigns • ${filtered.stats.sent.toLocaleString()} sent`;
+  renderAll();
 }
 
 function showBanner(msg){
