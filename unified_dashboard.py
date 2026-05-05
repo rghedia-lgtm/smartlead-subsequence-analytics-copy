@@ -38,11 +38,68 @@ PORT = int(os.getenv("DASHBOARD_PORT", 8081))
 
 LI_CACHE      = {"data": None, "ts": 0}
 EMAIL_CACHE   = {"data": None, "ts": 0}
-LI_TTL        = 30    # seconds
+LI_TTL        = 300   # 5 minutes (was 30s)
 EMAIL_TTL     = 1800  # 30 minutes (fast parallel fetch makes long cache fine)
+REFRESH_EVERY = 1500  # 25 minutes — pre-emptive refresh before TTL expires
 _email_lock   = threading.Lock()   # prevent concurrent Smartlead fetches
 _email_fetching = False            # True while a fetch is in progress
 _email_progress = {"phase": "Idle", "done": 0, "total": 0}
+
+# ── SQLite persistent cache ──────────────────────────────────────────
+import sqlite3
+DB_PATH = os.getenv("CACHE_DB_PATH",
+                    os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db"))
+
+
+def _db_init():
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("""CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            ts INTEGER NOT NULL
+        )""")
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _db_save(key, value):
+    """Atomically persist a JSON-serialisable value under `key`."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn.execute("INSERT OR REPLACE INTO kv (key, value, ts) VALUES (?, ?, ?)",
+                     (key, json.dumps(value, default=str), int(time.time())))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("[db] save %s failed: %s", key, e)
+
+
+def _db_load(key):
+    """Return (value, ts) or (None, 0)."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        cur  = conn.execute("SELECT value, ts FROM kv WHERE key = ?", (key,))
+        row  = cur.fetchone()
+        conn.close()
+        if row:
+            return json.loads(row[0]), int(row[1])
+    except Exception as e:
+        log.warning("[db] load %s failed: %s", key, e)
+    return None, 0
+
+
+_db_init()
+# Hydrate caches from SQLite on startup so dashboard is instant after restart
+_e_data, _e_ts = _db_load("email_cache")
+if _e_data:
+    EMAIL_CACHE["data"] = _e_data
+    EMAIL_CACHE["ts"]   = _e_ts
+    log.info("[db] Loaded email cache from SQLite (age=%ds, %d parents, %d subs)",
+             int(time.time()) - _e_ts,
+             len(_e_data.get("parent_analytics", [])),
+             len(_e_data.get("sub_analytics", [])))
 
 SAMPLE_EMAIL_DATA = {
     "loading": True,
@@ -242,6 +299,8 @@ def _do_email_fetch():
         _email_progress = {"phase": "Done", "done": len(parents), "total": len(parents)}
         log.info("Email data fetched in %.1fs (%d parents, %d subs).",
                  time.time() - now, len(parent_data), len(sub_data))
+        # Persist to SQLite so we don't lose the cache on restart
+        _db_save("email_cache", result)
     finally:
         _email_fetching = False
 
@@ -338,6 +397,42 @@ def api_email_status():
         "cached": bool(EMAIL_CACHE["data"]),
         "cache_age": round(time.time() - EMAIL_CACHE["ts"]) if EMAIL_CACHE["ts"] else None,
     })
+
+
+@app.route("/api/cache/info")
+def api_cache_info():
+    """Diagnostic endpoint — see freshness of all caches at once."""
+    now = time.time()
+    return jsonify({
+        "email": {
+            "cached":      bool(EMAIL_CACHE["data"]),
+            "age_seconds": round(now - EMAIL_CACHE["ts"]) if EMAIL_CACHE["ts"] else None,
+            "ttl_seconds": EMAIL_TTL,
+            "fetching":    _email_fetching,
+            "parents":     len((EMAIL_CACHE["data"] or {}).get("parent_analytics", [])),
+            "subs":        len((EMAIL_CACHE["data"] or {}).get("sub_analytics", [])),
+        },
+        "linkedin": {
+            "cached":      bool(LI_CACHE["data"]),
+            "age_seconds": round(now - LI_CACHE["ts"]) if LI_CACHE["ts"] else None,
+            "ttl_seconds": LI_TTL,
+        },
+        "scheduler": {
+            "refresh_every_seconds": REFRESH_EVERY,
+            "next_refresh_estimate": (round((EMAIL_CACHE["ts"] + REFRESH_EVERY) - now)
+                                       if EMAIL_CACHE["ts"] else None),
+        },
+        "db_path": DB_PATH,
+    })
+
+
+@app.route("/api/cache/refresh", methods=["POST"])
+def api_cache_refresh():
+    """Manual refresh trigger — kicks off a background fetch and returns immediately."""
+    if _email_fetching:
+        return jsonify({"ok": False, "error": "Already fetching"}), 409
+    threading.Thread(target=lambda: get_email_data(force=True), daemon=True).start()
+    return jsonify({"ok": True, "message": "Refresh started in background"})
 
 @app.route("/api/zoho-stats")
 def api_zoho_stats():
@@ -3456,10 +3551,30 @@ loadAll();
 </html>"""
 
 
+# ── Background scheduler: keeps cache fresh so dashboard is always instant ──
+def _scheduled_refresher():
+    """Refreshes email cache every REFRESH_EVERY seconds (25 min by default).
+    Runs forever in a daemon thread. First refresh waits REFRESH_EVERY since
+    startup pre-fetch already covers the initial load."""
+    while True:
+        try:
+            time.sleep(REFRESH_EVERY)
+            log.info("[scheduler] Auto-refreshing email cache...")
+            t0 = time.time()
+            get_email_data(force=True)
+            log.info("[scheduler] Auto-refresh done in %.1fs", time.time() - t0)
+        except Exception as e:
+            log.error("[scheduler] Refresh failed: %s", e, exc_info=True)
+            time.sleep(60)  # back off briefly on error
+
+
 # Pre-populate email cache in background so it's ready when the page first loads.
 # Runs under both `python unified_dashboard.py` and gunicorn (Render).
-if os.getenv("SMARTLEAD_API_KEY"):
+if os.getenv("SMARTLEAD_API_KEY") and not os.getenv("DISABLE_SCHEDULER"):
     threading.Thread(target=get_email_data, daemon=True).start()
+    threading.Thread(target=_scheduled_refresher, daemon=True).start()
+    log.info("[scheduler] Auto-refresh enabled (every %d min)", REFRESH_EVERY // 60)
+
 
 if __name__ == "__main__":
     log.info("Unified Analytics Dashboard → http://localhost:%d", PORT)
