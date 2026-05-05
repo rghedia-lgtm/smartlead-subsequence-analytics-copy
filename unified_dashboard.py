@@ -193,9 +193,27 @@ def _build_li_stats(accounts, campaigns, recent_leads, convos, filter_id=None):
     }
 
 def get_li_data(force=False):
+    """Return LinkedIn data. In cloud mode (default) reads from the GitHub
+    data-cache branch (populated by sync_cache.py via Actions cron). Falls
+    back to direct AimFox calls only if LOCAL_FETCH=1."""
     now = time.time()
     if not force and LI_CACHE["data"] and (now - LI_CACHE["ts"]) < LI_TTL:
         return LI_CACHE["data"]
+
+    if not os.getenv("LOCAL_FETCH"):
+        # Cloud mode — load from the same remote payload as email
+        payload = _fetch_remote_cache()
+        if payload:
+            _apply_remote_cache(payload)
+            if LI_CACHE["data"]:
+                return LI_CACHE["data"]
+        # If remote unavailable but we have stale data in memory, keep it
+        if LI_CACHE["data"]:
+            return LI_CACHE["data"]
+        # No data at all — return empty stub so client endpoints don't crash
+        return ([], [], [], [])
+
+    # Legacy: direct AimFox calls (LOCAL_FETCH=1 only)
     client    = AimfoxClient()
     accounts  = client.list_accounts()
     campaigns = client.list_campaigns()
@@ -316,21 +334,97 @@ def _do_email_fetch():
         _email_fetching = False
 
 
+# ── GitHub-backed cloud cache ─────────────────────────────────────────
+# Cache JSON is built every 30 min by a GitHub Actions cron job
+# (.github/workflows/sync-cache.yml → sync_cache.py) and pushed to the
+# `data-cache` branch. The dashboard ONLY reads from this URL — it never
+# calls Smartlead/AimFox directly. That makes Render → Smartlead IP
+# blocking irrelevant.
+GITHUB_CACHE_URL = os.getenv(
+    "GITHUB_CACHE_URL",
+    "https://raw.githubusercontent.com/rghedia-lgtm/smartlead-subsequence-analytics-copy/data-cache/data/cache.json",
+)
+
+
+def _fetch_remote_cache():
+    """Pull the latest cache.json from the data-cache branch on GitHub."""
+    try:
+        log.info("[remote] Fetching cache from %s", GITHUB_CACHE_URL)
+        r = requests.get(GITHUB_CACHE_URL, timeout=30,
+                         headers={"Cache-Control": "no-cache"})
+        r.raise_for_status()
+        return r.json()
+    except Exception as e:
+        log.warning("[remote] cache fetch failed: %s", e)
+        return None
+
+
+def _apply_remote_cache(payload):
+    """Hydrate EMAIL_CACHE + LI_CACHE from a sync_cache.py payload."""
+    if not payload:
+        return False
+    email = payload.get("email") or {}
+    EMAIL_CACHE["data"] = {
+        "parent_analytics": email.get("parent_analytics", []),
+        "sub_analytics":    email.get("sub_analytics", []),
+    }
+    EMAIL_CACHE["ts"] = time.time()
+    _db_save("email_cache", EMAIL_CACHE["data"])
+
+    li = payload.get("linkedin")
+    if li:
+        accounts  = li.get("accounts", [])
+        campaigns = li.get("campaigns", [])
+        recent    = li.get("recent_leads", [])
+        convos    = li.get("conversations", [])
+        # Build campaign-stat rows the same way get_li_data does
+        rows = _build_campaign_stats(campaigns, recent)
+        LI_CACHE["data"] = (accounts, rows, recent, convos)
+        LI_CACHE["ts"]   = time.time()
+    log.info("[remote] cache loaded: %d parents, %d subs, finished_at=%s",
+             len(EMAIL_CACHE["data"]["parent_analytics"]),
+             len(EMAIL_CACHE["data"]["sub_analytics"]),
+             payload.get("finished_at"))
+    return True
+
+
 def get_email_data(force=False):
+    """Return email data, sourcing it from the GitHub data-cache branch.
+    Falls back to local Smartlead fetch only if `LOCAL_FETCH=1` is set
+    (useful when developing on the dev machine where Smartlead isn't blocked)."""
     global _email_fetching
     now = time.time()
-    # Return cached data if still fresh
     if not force and EMAIL_CACHE["data"] and (now - EMAIL_CACHE["ts"]) < EMAIL_TTL:
         return EMAIL_CACHE["data"]
-    # If another thread is already fetching, wait for it to finish then return cache
+
+    # Default: pull from cloud cache (GitHub data-cache branch).
+    if not os.getenv("LOCAL_FETCH"):
+        if _email_fetching and not force:
+            with _email_lock:
+                pass
+            return EMAIL_CACHE["data"]
+        with _email_lock:
+            now = time.time()
+            if not force and EMAIL_CACHE["data"] and (now - EMAIL_CACHE["ts"]) < EMAIL_TTL:
+                return EMAIL_CACHE["data"]
+            _email_fetching = True
+            try:
+                payload = _fetch_remote_cache()
+                if payload:
+                    _apply_remote_cache(payload)
+                else:
+                    log.warning("[remote] No cache available — keeping prior data")
+            finally:
+                _email_fetching = False
+        return EMAIL_CACHE["data"]
+
+    # ── Legacy: direct Smartlead fetch (only when LOCAL_FETCH=1) ──
     if _email_fetching and not force:
         log.info("Email fetch already in progress — waiting for it to complete...")
-        with _email_lock:   # blocks until the running fetch releases it
+        with _email_lock:
             pass
         return EMAIL_CACHE["data"]
-    # Acquire lock, set flag, run fetch (flag cleared in finally inside _do_email_fetch)
     with _email_lock:
-        # Re-check cache after acquiring lock (another thread may have just filled it)
         now = time.time()
         if not force and EMAIL_CACHE["data"] and (now - EMAIL_CACHE["ts"]) < EMAIL_TTL:
             return EMAIL_CACHE["data"]

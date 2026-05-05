@@ -1,0 +1,68 @@
+name: Sync dashboard cache
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'   # every 30 min
+  workflow_dispatch:           # also run manually from GitHub UI
+
+# Allow only one run at a time so we don't push twice
+concurrency:
+  group: sync-cache
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Fetch from Smartlead + AimFox into data/cache.json
+        env:
+          SMARTLEAD_API_KEY: ${{ secrets.SMARTLEAD_API_KEY }}
+          AIMFOX_API_KEY:    ${{ secrets.AIMFOX_API_KEY }}
+        run: python sync_cache.py
+
+      - name: Commit cache.json to data-cache branch
+        run: |
+          set -e
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Use a worktree on the data-cache branch so we don't dirty main
+          git fetch origin data-cache:data-cache 2>/dev/null || true
+
+          if git show-ref --verify --quiet refs/heads/data-cache; then
+            git worktree add ../cache-tree data-cache
+          else
+            git worktree add --detach ../cache-tree
+            cd ../cache-tree
+            git checkout --orphan data-cache
+            git rm -rf . 2>/dev/null || true
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          mkdir -p ../cache-tree/data
+          cp data/cache.json ../cache-tree/data/cache.json
+
+          cd ../cache-tree
+          git add data/cache.json
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "data: refresh cache $(date -u '+%Y-%m-%d %H:%M UTC')"
+            git push origin HEAD:data-cache
+            echo "Pushed updated cache to data-cache branch"
+          fi
