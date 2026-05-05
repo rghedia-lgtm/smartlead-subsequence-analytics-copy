@@ -3117,6 +3117,9 @@ const CLIENT = "{{client.name}}";
 let DATA = null;       // currently displayed (may be filtered)
 let DATA_FULL = null;  // unfiltered original from /api/client/<slug>
 let CHARTS = {};
+const PAGE_SIZE  = 10;
+let parentPage   = 0;
+let subPage      = 0;
 
 const POSITIVE = new Set(["interested","meeting booked","positive","meeting request","will buy","warm","demo request"]);
 
@@ -3399,9 +3402,14 @@ function subLeads(filter){
 }
 
 function renderParents(){
-  const rows = DATA.parent_campaigns||[];
-  document.getElementById("parent-count").textContent = rows.length;
-  if(!rows.length){document.getElementById("parent-table").innerHTML='<div class="no-data">No parent campaigns for this client.</div>';return;}
+  const all = DATA.parent_campaigns||[];
+  document.getElementById("parent-count").textContent = all.length;
+  if(!all.length){document.getElementById("parent-table").innerHTML='<div class="no-data">No parent campaigns for this client.</div>';return;}
+  const totalPages = Math.max(1, Math.ceil(all.length / PAGE_SIZE));
+  if(parentPage >= totalPages) parentPage = 0;
+  if(parentPage < 0)            parentPage = totalPages - 1;
+  const start = parentPage * PAGE_SIZE;
+  const rows  = all.slice(start, start + PAGE_SIZE);
   const html = `<table><thead><tr>
     <th>Campaign</th><th>Status</th>
     <th style="text-align:right">Total</th><th style="text-align:right">Opened</th>
@@ -3409,7 +3417,7 @@ function renderParents(){
     <th style="text-align:right">Bounced</th><th style="text-align:right">Added to Sub</th>
     <th style="text-align:right">Open %</th><th style="text-align:right">Reply %</th>
   </tr></thead><tbody>
-  ${rows.map((r,i)=>`<tr>
+  ${rows.map((r,idx)=>{ const i = start + idx; return `<tr>
     <td>${escapeHtml(r.raw_name || r.client || '')}</td>
     <td><span class="badge b-info">${escapeHtml(r.status||'—')}</span></td>
     <td style="text-align:right" class="clickable" onclick="openParentLeads(${i},'all','All leads')">${fmt(r.total)}</td>
@@ -3420,10 +3428,11 @@ function renderParents(){
     <td style="text-align:right" class="clickable" onclick="openParentLeads(${i},'all','Added to Sub')">${fmt(r.added_to_sub)}</td>
     <td style="text-align:right;color:${rateColor(r.open_rate||0)};font-weight:700">${(+r.open_rate||0).toFixed(1)}%</td>
     <td style="text-align:right;color:${rateColor(r.reply_rate||0)};font-weight:700">${(+r.reply_rate||0).toFixed(1)}%</td>
-  </tr>`).join("")}
-  </tbody></table>`;
+  </tr>`; }).join("")}
+  </tbody></table>${paginator(parentPage, totalPages, all.length, "setParentPage")}`;
   document.getElementById("parent-table").innerHTML = html;
 }
+function setParentPage(p){ parentPage = p; renderParents(); document.getElementById("parent-table").scrollIntoView({behavior:"smooth", block:"start"}); }
 
 function openParentLeads(idx, kind, title){
   const p = (DATA.parent_campaigns||[])[idx];
@@ -3455,16 +3464,21 @@ function drawBar(id, labels, data, color, lbl){
 }
 
 function renderSubs(){
-  const rows = DATA.subsequences||[];
-  document.getElementById("sub-count").textContent = rows.length;
-  if(!rows.length) return;
+  const all = DATA.subsequences||[];
+  document.getElementById("sub-count").textContent = all.length;
+  if(!all.length) return;
+  const totalPages = Math.max(1, Math.ceil(all.length / PAGE_SIZE));
+  if(subPage >= totalPages) subPage = 0;
+  if(subPage < 0)            subPage = totalPages - 1;
+  const start = subPage * PAGE_SIZE;
+  const rows  = all.slice(start, start + PAGE_SIZE);
   document.getElementById("sub-table").innerHTML = `<table><thead><tr>
     <th>Subsequence</th>
     <th style="text-align:right">Total</th><th style="text-align:right">Opened</th>
     <th style="text-align:right">Clicked</th><th style="text-align:right">Replied</th>
     <th style="text-align:right">Open %</th><th style="text-align:right">Reply %</th>
   </tr></thead><tbody>
-  ${rows.map((r,i)=>`<tr>
+  ${rows.map((r,idx)=>{ const i = start + idx; return `<tr>
     <td>${escapeHtml(r.subsequence||'')}</td>
     <td style="text-align:right" class="clickable" onclick="openSubLeads(${i},'all','All')">${fmt(r.total)}</td>
     <td style="text-align:right" class="clickable" onclick="openSubLeads(${i},'open','Opened')">${fmt(r.opened)}</td>
@@ -3472,8 +3486,28 @@ function renderSubs(){
     <td style="text-align:right" class="clickable" onclick="openSubLeads(${i},'reply','Replied')">${fmt(r.replied)}</td>
     <td style="text-align:right;color:${rateColor(r.open_rate||0)};font-weight:700">${(+r.open_rate||0).toFixed(1)}%</td>
     <td style="text-align:right;color:${rateColor(r.reply_rate||0)};font-weight:700">${(+r.reply_rate||0).toFixed(1)}%</td>
-  </tr>`).join("")}
-  </tbody></table>`;
+  </tr>`; }).join("")}
+  </tbody></table>${paginator(subPage, totalPages, all.length, "setSubPage")}`;
+}
+function setSubPage(p){ subPage = p; renderSubs(); document.getElementById("sub-table").scrollIntoView({behavior:"smooth", block:"start"}); }
+
+// Shared pagination footer renderer
+function paginator(page, totalPages, totalRows, fnName){
+  if(totalPages <= 1) return "";
+  const start = page * PAGE_SIZE + 1;
+  const end   = Math.min(totalRows, (page + 1) * PAGE_SIZE);
+  const btn = (lbl, target, dis) =>
+    `<button onclick="${fnName}(${target})" ${dis?'disabled':''}
+      style="padding:6px 14px;border-radius:7px;font-size:12px;font-weight:700;cursor:${dis?'not-allowed':'pointer'};
+        background:${dis?'#f1f5f9':'#4f46e5'};color:${dis?'#94a3b8':'#fff'};border:none;opacity:${dis?'.5':'1'}">${lbl}</button>`;
+  return `<div style="display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-top:1px solid #f1f5f9;background:#fafbfc">
+    <span style="font-size:11px;color:#64748b;font-weight:600">Showing ${start}–${end} of ${totalRows.toLocaleString()}</span>
+    <div style="display:flex;gap:6px;align-items:center">
+      ${btn("← Prev", page - 1, page === 0)}
+      <span style="font-size:11px;color:#475569;font-weight:700;padding:0 10px">Page ${page + 1} of ${totalPages}</span>
+      ${btn("Next →", page + 1, page >= totalPages - 1)}
+    </div>
+  </div>`;
 }
 function openSubLeads(idx, kind, title){
   const s = (DATA.subsequences||[])[idx]; if(!s) return;
