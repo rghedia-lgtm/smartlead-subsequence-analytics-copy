@@ -623,16 +623,56 @@ def api_zoho_stats():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/zoho-sync", methods=["POST"])
-def api_zoho_sync():
-    if not ZOHO_AVAILABLE:
-        return jsonify({"ok": False, "error": "Zoho credentials not configured"}), 400
+# ── Zoho sync — async/background pattern ─────────────────────────
+# Old behaviour: POST blocked for 25-30 s while sync ran -> Cloudflare
+# sometimes killed the request and the browser showed "Failed to fetch".
+# New: POST returns immediately (202), sync runs in a daemon thread,
+# JS polls /api/zoho-sync/status until phase == "done".
+_zoho_state = {"running": False, "phase": "idle",
+               "created": 0, "updated": 0, "error": None,
+               "started_at": None, "finished_at": None}
+_zoho_lock  = threading.Lock()
+
+
+def _run_zoho_sync_async():
+    global _zoho_state
     try:
+        _zoho_state.update({
+            "running": True, "phase": "syncing", "error": None,
+            "started_at": datetime.utcnow().isoformat() + "Z",
+            "finished_at": None, "created": 0, "updated": 0,
+        })
         counts = zoho_sync.run_sync(sync_conversations=False, module="Leads")
-        return jsonify({"ok": True, **counts})
+        _zoho_state.update({
+            "phase": "done",
+            "created": counts.get("created", 0),
+            "updated": counts.get("updated", 0),
+        })
     except Exception as e:
         log.error("Zoho sync error: %s", e, exc_info=True)
-        return jsonify({"ok": False, "error": str(e)}), 500
+        _zoho_state.update({"phase": "error", "error": str(e)})
+    finally:
+        _zoho_state["running"] = False
+        _zoho_state["finished_at"] = datetime.utcnow().isoformat() + "Z"
+
+
+@app.route("/api/zoho-sync", methods=["POST"])
+def api_zoho_sync():
+    """Kick off Zoho sync in the background. Returns immediately."""
+    if not ZOHO_AVAILABLE:
+        return jsonify({"ok": False, "error": "Zoho credentials not configured"}), 400
+    with _zoho_lock:
+        if _zoho_state["running"]:
+            return jsonify({"ok": True, "message": "already running",
+                            "state": _zoho_state}), 202
+        threading.Thread(target=_run_zoho_sync_async, daemon=True).start()
+    return jsonify({"ok": True, "message": "sync started",
+                    "state": _zoho_state}), 202
+
+
+@app.route("/api/zoho-sync/status")
+def api_zoho_sync_status():
+    return jsonify(_zoho_state)
 
 # ── Helpers for export / email ────────────────────────────────────────
 
@@ -3897,16 +3937,43 @@ function renderZoho(){
 
 async function syncNow(){
   const body = document.getElementById("zoho-body");
-  body.innerHTML = '<div style="color:#6366f1">⏳ Syncing to Zoho…</div>';
+  body.innerHTML = '<div style="color:#6366f1;font-weight:600">🔄 Sync started in background — this can take 30-60 seconds…</div>';
   try{
+    // Kick off the sync; this returns immediately (202)
     const r = await fetch("/api/zoho-sync", {method:"POST"});
     const d = await r.json();
-    if(d.ok){
-      body.innerHTML = `<div style="color:#16a34a;font-weight:700">✅ Sync complete: ${fmt(d.created||0)} created, ${fmt(d.updated||0)} updated</div>`;
-      setTimeout(()=>loadAll(true), 1500);
-    } else {
-      body.innerHTML = `<div style="color:#dc2626">❌ ${escapeHtml(d.error||'Sync failed')}</div>`;
+    if(!d.ok){
+      body.innerHTML = `<div style="color:#dc2626">❌ ${escapeHtml(d.error||'Sync failed to start')}</div>`;
+      return;
     }
+    // Poll status every 3 seconds
+    let polls = 0;
+    const poll = async () => {
+      polls += 1;
+      try{
+        const sr = await fetch("/api/zoho-sync/status");
+        const s  = await sr.json();
+        if(s.phase === "done"){
+          body.innerHTML = `<div style="color:#16a34a;font-weight:700">✅ Sync complete — ${fmt(s.created||0)} created, ${fmt(s.updated||0)} updated</div>`;
+          setTimeout(()=>loadAll(true), 1500);
+          return;
+        }
+        if(s.phase === "error"){
+          body.innerHTML = `<div style="color:#dc2626">❌ ${escapeHtml(s.error||'Sync failed')}</div>`;
+          return;
+        }
+        // Still running — keep polling (cap at 40 polls = ~2 min)
+        body.innerHTML = `<div style="color:#6366f1;font-weight:600">🔄 Syncing… (${polls*3}s elapsed)</div>`;
+        if(polls < 40){
+          setTimeout(poll, 3000);
+        } else {
+          body.innerHTML = `<div style="color:#dc2626">⏱ Sync taking longer than expected. Check back in a minute and click Refresh.</div>`;
+        }
+      } catch(e){
+        body.innerHTML = `<div style="color:#dc2626">❌ Status check failed: ${escapeHtml(e.message)}</div>`;
+      }
+    };
+    setTimeout(poll, 3000);
   } catch(e){
     body.innerHTML = `<div style="color:#dc2626">❌ ${escapeHtml(e.message)}</div>`;
   }
