@@ -1140,6 +1140,10 @@ def api_client(slug):
 
     # ── LinkedIn — filter campaigns/convos/leads by client keyword ────
     li_campaigns, li_convos, li_leads = [], [], []
+    li_stats = {"sent": 0, "accepted": 0, "replies": 0,
+                "conversations": 0, "active_conversations": 0,
+                "unique_companies": 0, "accept_rate": 0.0, "reply_rate": 0.0}
+    li_companies = []  # [{name, conversations, last_msg, accepted}]
     try:
         accounts, lcamps, lrecent, lconvos = get_li_data()
         acc_map = {a["id"]: a.get("full_name", a["id"]) for a in accounts}
@@ -1150,11 +1154,11 @@ def api_client(slug):
             li_campaigns.append({
                 "id": c["id"], "name": c.get("name", ""),
                 "state": c.get("state", ""), "type": c.get("type", ""),
-                "targets": c.get("targets", 0),
+                "targets": c.get("targets", 0) or 0,
                 "owners": [acc_map.get(o, o) for o in _owners_list(c.get("owners"))],
-                "completion_pct": c.get("completion_pct", 0),
-                "accepted": c.get("accepted", 0),
-                "replies":  c.get("replies",  0),
+                "completion_pct": c.get("completion_pct", 0) or 0,
+                "accepted_recent": c.get("accepted_recent", 0) or 0,
+                "replies_recent":  c.get("replies_recent",  0) or 0,
             })
         for ev in lrecent:
             if ev.get("campaign_id") in camp_ids:
@@ -1166,17 +1170,92 @@ def api_client(slug):
                     "account":    acc_map.get(ev.get("account_id"), ev.get("account_id", "")),
                     "date":       (ev.get("timestamp") or "")[:10],
                 })
+        # Build conversation list and harvest companies
+        # Conversations don't carry campaign_id — match by owner account
+        # (any account that owns one of this client's matched campaigns).
+        client_owner_ids = set()
+        for c in match:
+            for o in _owners_list(c.get("owners")):
+                client_owner_ids.add(o)
+
+        comp_seen = {}  # company_name -> {conversations, lead_names, last_msg}
         for cv in lconvos:
-            if cv.get("campaign_id") in camp_ids or _matches_client(cv.get("campaign_name"), keywords):
-                li_convos.append({
-                    "lead":       cv.get("lead_name", ""),
-                    "occupation": cv.get("occupation", ""),
-                    "campaign":   cv.get("campaign_name", ""),
-                    "account":    acc_map.get(cv.get("account_id"), cv.get("account_id", "")),
-                    "msgs":       cv.get("msg_count", 0),
-                    "unread":     cv.get("unread", 0),
-                    "last":       (cv.get("last_message_time") or "")[:19],
-                })
+            cv_camp_name = cv.get("campaign_name", "")
+            cv_camp_id   = cv.get("campaign_id")
+            cv_owner     = cv.get("owner") or cv.get("account_id")
+            owner_match  = cv_owner in client_owner_ids if client_owner_ids else False
+            if (cv_camp_id in camp_ids
+                    or _matches_client(cv_camp_name, keywords)
+                    or owner_match):
+                # Raw AimFox conversation: lead is in participants[0],
+                # messages are under _messages, unread is unread_count.
+                parts = cv.get("participants", []) or []
+                lead_part = parts[0] if parts else {}
+                lead_name = (cv.get("lead_name")
+                             or lead_part.get("full_name")
+                             or lead_part.get("name") or "")
+                occ = (cv.get("lead_occupation")
+                       or lead_part.get("occupation")
+                       or cv.get("occupation") or "")
+                # Parse company from occupation: "Title at Company"
+                company = ""
+                if " at " in occ:
+                    company = occ.split(" at ", 1)[1].strip()
+                elif " @ " in occ:
+                    company = occ.split(" @ ", 1)[1].strip()
+                # Trim trailing noise like "| Hiring" or location suffixes
+                for sep in [" |", "  ", " - "]:
+                    if sep in company:
+                        company = company.split(sep, 1)[0].strip()
+                msgs = cv.get("_messages") or cv.get("messages") or []
+                last_msg_time = ""
+                if msgs:
+                    last_msg_time = max(
+                        str(m.get("created_at") or m.get("date") or "")
+                        for m in msgs
+                    )[:19]
+                connected = cv.get("connected", False)
+                unread    = cv.get("unread_count", cv.get("unread", 0)) or 0
+                conv_row = {
+                    "lead":       lead_name,
+                    "occupation": occ,
+                    "company":    company,
+                    "campaign":   cv_camp_name,
+                    "owner":      cv.get("owner_name") or acc_map.get(cv_owner, cv_owner) or "",
+                    "msgs":       len(msgs),
+                    "unread":     unread,
+                    "connected":  bool(connected) and str(connected).lower() != "false",
+                    "last":       last_msg_time,
+                }
+                li_convos.append(conv_row)
+                if company:
+                    if company not in comp_seen:
+                        comp_seen[company] = {"name": company, "conversations": 0,
+                                              "leads": [], "last_msg": ""}
+                    comp_seen[company]["conversations"] += 1
+                    if lead_name and lead_name not in comp_seen[company]["leads"]:
+                        comp_seen[company]["leads"].append(lead_name)
+                    if last_msg_time > comp_seen[company]["last_msg"]:
+                        comp_seen[company]["last_msg"] = last_msg_time
+
+        li_companies = sorted(comp_seen.values(),
+                              key=lambda x: -x["conversations"])
+
+        # Aggregate KPIs
+        sent     = sum(c["targets"] for c in li_campaigns)
+        accepted = sum(1 for l in li_leads if l["transition"] == "accepted")
+        replies  = sum(1 for l in li_leads if l["transition"] == "reply")
+        active   = sum(1 for c in li_convos if c["connected"] and c["msgs"] > 0)
+        li_stats = {
+            "sent":                  sent,
+            "accepted":              accepted,
+            "replies":               replies,
+            "conversations":         len(li_convos),
+            "active_conversations":  active,
+            "unique_companies":      len(li_companies),
+            "accept_rate":           round(accepted / sent * 100, 1) if sent else 0.0,
+            "reply_rate":            round(replies / accepted * 100, 1) if accepted else 0.0,
+        }
     except Exception as e:
         log.warning("Client LinkedIn fetch error: %s", e)
 
@@ -1206,8 +1285,10 @@ def api_client(slug):
         "positive_leads":  pos_leads,
         "linkedin": {
             "campaigns":     li_campaigns,
-            "lead_events":   li_leads[:200],
-            "conversations": li_convos[:200],
+            "lead_events":   li_leads[:500],
+            "conversations": li_convos[:500],
+            "companies":     li_companies,
+            "stats":         li_stats,
         },
         "zoho": zoho,
     })
@@ -2919,8 +3000,12 @@ tbody tr:hover td{background:#fafbff}
   </div>
 
   <!-- ─── 1. Stats Overview ─────────────────────────────────────── -->
-  <div class="section-label"><h2>📊 {{client.name}} — Overview</h2><span class="pill">click any card to drill into leads</span></div>
+  <div class="section-label"><h2>📊 {{client.name}} — Email Overview</h2><span class="pill">click any card to drill into leads</span></div>
   <div class="grid-stats" id="stats-grid"></div>
+
+  <!-- ─── 1b. LinkedIn Overview ─────────────────────────────────── -->
+  <div class="section-label" style="margin-top:14px"><h2>🔗 {{client.name}} — LinkedIn Overview</h2><span class="pill" style="background:#dbeafe;color:#1d4ed8">Aimfox</span></div>
+  <div class="grid-stats" id="li-stats-grid"></div>
 
   <!-- ─── 2. Parent Campaigns ───────────────────────────────────── -->
   <div class="section-label"><h2>📧 Parent Campaigns</h2></div>
@@ -3171,12 +3256,53 @@ function hideBanner(){document.getElementById("banner").classList.remove("show")
 
 function renderAll(){
   renderStats();
+  renderLIStats();
   renderParents();
   renderCharts();
   renderSubs();
   renderPositive();
   renderLI();
   renderZoho();
+}
+
+function renderLIStats(){
+  const li = DATA.linkedin || {};
+  const s  = li.stats || {};
+  const camps = li.campaigns || [];
+  const convs = li.conversations || [];
+  const companies = li.companies || [];
+  const leadEvents = li.lead_events || [];
+  const cards = [
+    {key:"li_campaigns", lbl:"Campaigns",       val: camps.length, icon:"🎯", col:"c-purple",
+     leads:()=>camps.map(c=>({name:c.name, _campaign:c.type+" · "+c.state, sent_time:c.created}))},
+    {key:"li_sent",      lbl:"Requests Sent",   val: s.sent||0, icon:"📤", col:"c-blue"},
+    {key:"li_accepted",  lbl:"Accepted",        val: s.accepted||0, icon:"🤝", col:"c-green",
+     sub:`${s.accept_rate||0}%`,
+     leads:()=>leadEvents.filter(e=>e.transition==="accepted").map(e=>({name:e.lead, email:e.occupation, _campaign:e.campaign, sent_time:e.date}))},
+    {key:"li_replies",   lbl:"Replies Received",val: s.replies||0, icon:"💬", col:"c-amber",
+     sub:`${s.reply_rate||0}%`,
+     leads:()=>leadEvents.filter(e=>e.transition==="reply").map(e=>({name:e.lead, email:e.occupation, _campaign:e.campaign, sent_time:e.date}))},
+    {key:"li_convs",     lbl:"Conversations",   val: s.conversations||0, icon:"💭", col:"c-cyan",
+     leads:()=>convs.map(c=>({name:c.lead, email:c.occupation, _campaign:c.campaign, reply_time:c.last}))},
+    {key:"li_active",    lbl:"Active Convos",   val: s.active_conversations||0, icon:"🔥", col:"c-orange",
+     leads:()=>convs.filter(c=>c.connected && c.msgs>0).map(c=>({name:c.lead, email:c.occupation, _campaign:c.campaign, reply_time:c.last}))},
+    {key:"li_companies", lbl:"Companies in Convo", val: s.unique_companies||0, icon:"🏢", col:"c-rose",
+     leads:()=>companies.map(c=>({name:c.name, email:`${c.conversations} convo${c.conversations!==1?'s':''}`, _campaign:(c.leads||[]).slice(0,3).join(", "), reply_time:c.last_msg}))},
+  ];
+  document.getElementById("li-stats-grid").innerHTML = cards.map((c,i)=>`
+    <div class="stat-card ${c.col}" data-li-idx="${i}">
+      <div class="stat-icon">${c.icon}</div>
+      <div class="stat-val">${fmt(c.val)}</div>
+      <div class="stat-lbl">${c.lbl}</div>
+      ${c.sub?`<div class="stat-sub">${c.sub}</div>`:""}
+    </div>`).join("");
+  document.querySelectorAll("#li-stats-grid .stat-card").forEach((el,i)=>{
+    if(cards[i].leads){
+      el.onclick = ()=>openLeadModal(`${cards[i].lbl} - ${CLIENT}`, cards[i].leads());
+    } else {
+      el.style.cursor = "default";
+    }
+  });
 }
 
 function renderStats(){
