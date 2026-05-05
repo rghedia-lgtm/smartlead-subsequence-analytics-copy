@@ -11,6 +11,7 @@ and never calls Smartlead/AimFox itself.
 
 Run locally:  python sync_cache.py
 """
+import gzip
 import json
 import logging
 import os
@@ -46,8 +47,47 @@ log = logging.getLogger(__name__)
 # Smartlead rate limit is ~60 req/min; with retry-on-429 backoff we can
 # stay close to 2 workers without losing data. Tune via env var.
 FETCH_WORKERS = int(os.getenv("SYNC_WORKERS", "2"))
-OUTPUT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                           "data", "cache.json")
+OUTPUT_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+# We write a gzipped JSON so the resulting file fits within GitHub's
+# 100 MB single-file limit (raw JSON is ~120-150 MB at scale).
+OUTPUT_PATH    = os.path.join(OUTPUT_DIR, "cache.json")       # uncompressed (debug only)
+OUTPUT_GZ_PATH = os.path.join(OUTPUT_DIR, "cache.json.gz")    # served to dashboard
+
+
+# Cap on stored content per lead — keeps the JSON manageable.
+MAX_MSG_BODY_CHARS = 400
+MAX_MSGS_PER_LEAD  = 8
+
+
+def slim_lead(lead):
+    """Drop bulky/unused fields from a Smartlead lead so the cache fits."""
+    msgs = lead.get("messages") or []
+    return {
+        "name":      lead.get("name") or lead.get("email") or "Unknown",
+        "email":     lead.get("email", ""),
+        "category":  lead.get("category", ""),
+        "company":   lead.get("company", ""),
+        "sent_time":  (lead.get("sent_time")  or "")[:19],
+        "open_time":  (lead.get("open_time")  or "")[:19],
+        "click_time": (lead.get("click_time") or "")[:19],
+        "reply_time": (lead.get("reply_time") or "")[:19],
+        "messages": [
+            {
+                "from": (m.get("from") or "")[:80],
+                "type": (m.get("type") or "")[:30],
+                "time": (m.get("time") or "")[:19],
+                "body": (m.get("body") or "")[:MAX_MSG_BODY_CHARS],
+            }
+            for m in msgs[:MAX_MSGS_PER_LEAD]
+        ],
+    }
+
+
+def slim_campaign(camp):
+    """Slim a parent or sub campaign row in-place without losing aggregates."""
+    leads = camp.get("leads") or []
+    camp["leads"] = [slim_lead(l) for l in leads]
+    return camp
 
 
 def _fetch_sub(sub, parent_map):
@@ -172,10 +212,31 @@ def main():
     linkedin_data = fetch_linkedin_data()
     finished      = datetime.utcnow().isoformat() + "Z"
 
+    # Slim every campaign's leads (cap body chars + messages per lead)
+    log.info("Slimming lead data…")
+    for p in email_data["parent_analytics"]:
+        slim_campaign(p)
+    for s in email_data["sub_analytics"]:
+        slim_campaign(s)
+
+    # Slim AimFox conversation messages too — they can be huge
+    if linkedin_data and "conversations" in linkedin_data:
+        for cv in linkedin_data["conversations"]:
+            msgs = cv.get("_messages") or []
+            cv["_messages"] = [
+                {
+                    "body": (m.get("body") or "")[:MAX_MSG_BODY_CHARS],
+                    "automated": m.get("automated", False),
+                    "date": str(m.get("created_at", m.get("date", "")))[:19],
+                    "sender": (m.get("sender") or {}).get("full_name", "") if isinstance(m.get("sender"), dict) else "",
+                }
+                for m in msgs[:MAX_MSGS_PER_LEAD]
+            ]
+
     sent_total = sum(p.get("total", 0) for p in email_data["parent_analytics"])
 
     payload = {
-        "version":     1,
+        "version":     2,
         "started_at":  started,
         "finished_at": finished,
         "email":       email_data,
@@ -189,13 +250,18 @@ def main():
         },
     }
 
-    os.makedirs(os.path.dirname(OUTPUT_PATH), exist_ok=True)
-    with open(OUTPUT_PATH, "w", encoding="utf-8") as f:
-        json.dump(payload, f, default=str, ensure_ascii=False)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    raw_bytes = json.dumps(payload, default=str, ensure_ascii=False).encode("utf-8")
+    with open(OUTPUT_PATH, "wb") as f:
+        f.write(raw_bytes)
+    with gzip.open(OUTPUT_GZ_PATH, "wb", compresslevel=9) as f:
+        f.write(raw_bytes)
 
-    log.info("Wrote %s — %d parents, %d subs, %d sent",
-             OUTPUT_PATH, payload["stats"]["parents"],
-             payload["stats"]["subs"], sent_total)
+    raw_mb = len(raw_bytes) / (1024 * 1024)
+    gz_mb  = os.path.getsize(OUTPUT_GZ_PATH) / (1024 * 1024)
+    log.info("Wrote %s — %d parents, %d subs, %d sent  (raw %.1fMB → gzip %.1fMB)",
+             OUTPUT_GZ_PATH, payload["stats"]["parents"],
+             payload["stats"]["subs"], sent_total, raw_mb, gz_mb)
 
 
 if __name__ == "__main__":

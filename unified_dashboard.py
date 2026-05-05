@@ -342,17 +342,25 @@ def _do_email_fetch():
 # blocking irrelevant.
 GITHUB_CACHE_URL = os.getenv(
     "GITHUB_CACHE_URL",
-    "https://raw.githubusercontent.com/rghedia-lgtm/smartlead-subsequence-analytics-copy/data-cache/data/cache.json",
+    "https://raw.githubusercontent.com/rghedia-lgtm/smartlead-subsequence-analytics-copy/data-cache/data/cache.json.gz",
 )
 
 
 def _fetch_remote_cache():
-    """Pull the latest cache.json from the data-cache branch on GitHub."""
+    """Pull the latest cache.json.gz from the data-cache branch on GitHub
+    and decompress it. (Raw uncompressed JSON is too large for GitHub's
+    100 MB single-file limit, hence the gzip step.)"""
     try:
+        import gzip, io
         log.info("[remote] Fetching cache from %s", GITHUB_CACHE_URL)
-        r = requests.get(GITHUB_CACHE_URL, timeout=30,
+        r = requests.get(GITHUB_CACHE_URL, timeout=60,
                          headers={"Cache-Control": "no-cache"})
         r.raise_for_status()
+        # If URL ends with .gz, decompress; otherwise treat as raw JSON
+        if GITHUB_CACHE_URL.endswith(".gz"):
+            buf = io.BytesIO(r.content)
+            with gzip.open(buf, "rb") as gz:
+                return json.loads(gz.read().decode("utf-8"))
         return r.json()
     except Exception as e:
         log.warning("[remote] cache fetch failed: %s", e)

@@ -55,14 +55,20 @@ jobs:
           fi
 
           mkdir -p ../cache-tree/data
-          cp data/cache.json ../cache-tree/data/cache.json
+          # Push only the gzipped file — raw cache.json can exceed
+          # GitHub's 100 MB limit. Dashboard fetches .gz and inflates.
+          cp data/cache.json.gz ../cache-tree/data/cache.json.gz
+          # Remove any old uncompressed cache.json that may have been
+          # committed by an earlier run.
+          rm -f ../cache-tree/data/cache.json
 
           cd ../cache-tree
-          git add data/cache.json
+          git add data/cache.json.gz
+          git rm -f data/cache.json 2>/dev/null || true
           if git diff --cached --quiet; then
             echo "No changes to commit"
           else
             git commit -m "data: refresh cache $(date -u '+%Y-%m-%d %H:%M UTC')"
             git push origin HEAD:data-cache
-            echo "Pushed updated cache to data-cache branch"
+            echo "Pushed updated cache.json.gz to data-cache branch"
           fi
