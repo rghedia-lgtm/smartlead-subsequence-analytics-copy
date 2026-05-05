@@ -349,19 +349,46 @@ GITHUB_CACHE_URL = os.getenv(
 def _fetch_remote_cache():
     """Pull the latest cache.json.gz from the data-cache branch on GitHub
     and decompress it. (Raw uncompressed JSON is too large for GitHub's
-    100 MB single-file limit, hence the gzip step.)"""
+    100 MB single-file limit, hence the gzip step.)
+
+    Repo is private, so we need to authenticate. Two paths:
+      1. raw.githubusercontent.com with `Authorization: Bearer <PAT>`
+      2. api.github.com/repos/.../contents/... with same Bearer header
+
+    We try (1) first since it's a single hop; fall back to (2) if needed.
+    The token comes from the GITHUB_CACHE_TOKEN env var.
+    """
+    import gzip, io
+    headers = {"Cache-Control": "no-cache"}
+    token = os.getenv("GITHUB_CACHE_TOKEN") or os.getenv("GITHUB_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
-        import gzip, io
         log.info("[remote] Fetching cache from %s", GITHUB_CACHE_URL)
-        r = requests.get(GITHUB_CACHE_URL, timeout=60,
-                         headers={"Cache-Control": "no-cache"})
-        r.raise_for_status()
-        # If URL ends with .gz, decompress; otherwise treat as raw JSON
-        if GITHUB_CACHE_URL.endswith(".gz"):
-            buf = io.BytesIO(r.content)
-            with gzip.open(buf, "rb") as gz:
+        r = requests.get(GITHUB_CACHE_URL, timeout=60, headers=headers)
+        if r.status_code == 404 and token:
+            # Private repo raw URLs sometimes 404 even with auth; fall back
+            # to the contents API which always works for read-token PATs.
+            api_url = (
+                "https://api.github.com/repos/"
+                "rghedia-lgtm/smartlead-subsequence-analytics-copy/"
+                "contents/data/cache.json.gz?ref=data-cache"
+            )
+            log.info("[remote] raw URL 404 — trying contents API: %s", api_url)
+            api_r = requests.get(api_url, timeout=30, headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.github.v3.raw",
+            })
+            api_r.raise_for_status()
+            content = api_r.content
+        else:
+            r.raise_for_status()
+            content = r.content
+        # Decompress if .gz
+        if GITHUB_CACHE_URL.endswith(".gz") or content[:2] == b"\x1f\x8b":
+            with gzip.open(io.BytesIO(content), "rb") as gz:
                 return json.loads(gz.read().decode("utf-8"))
-        return r.json()
+        return json.loads(content.decode("utf-8"))
     except Exception as e:
         log.warning("[remote] cache fetch failed: %s", e)
         return None
