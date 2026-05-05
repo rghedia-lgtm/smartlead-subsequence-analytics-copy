@@ -3195,25 +3195,37 @@ function applyDate(silent){
     const t = String(ts).slice(0,19);
     return t >= lo && t <= hi;
   };
-  // A lead is "in range" if its sent_time falls in the window
-  // (campaigns where no leads were sent in window get total=0)
+  // Each metric is counted by ITS OWN timestamp falling in the window.
+  // A reply on May 3 to a lead sent April 28 still counts as a "May reply"
+  // even though the original send was outside the window.
   const filterCamp = (camp) => {
-    const leads = (camp.leads||[]).filter(l => inRange(l.sent_time));
-    const total = leads.length;
-    const opened       = leads.filter(l => inRange(l.open_time)).length;
-    const clicked      = leads.filter(l => inRange(l.click_time)).length;
-    const replied      = leads.filter(l => inRange(l.reply_time)).length;
-    const bounced      = leads.filter(l => (l.category||"").toLowerCase()==="bounced").length;
-    const unsubscribed = leads.filter(l => (l.category||"").toLowerCase()==="unsubscribed").length;
+    const all     = camp.leads || [];
+    const sent    = all.filter(l => inRange(l.sent_time));
+    const opened  = all.filter(l => inRange(l.open_time));
+    const clicked = all.filter(l => inRange(l.click_time));
+    const replied = all.filter(l => inRange(l.reply_time));
+    // Anything-in-window union = the lead pool we expose for drill-down
+    const inWindow = all.filter(l =>
+      inRange(l.sent_time)  || inRange(l.open_time) ||
+      inRange(l.click_time) || inRange(l.reply_time)
+    );
+    const bounced      = inWindow.filter(l => (l.category||"").toLowerCase()==="bounced").length;
+    const unsubscribed = inWindow.filter(l => (l.category||"").toLowerCase()==="unsubscribed").length;
     const added_to_sub = camp.added_to_sub_emails
-        ? leads.filter(l => (camp.added_to_sub_emails||[]).includes(l.email)).length
-        : leads.filter(l => l.added_to_sub).length;
+        ? sent.filter(l => (camp.added_to_sub_emails||[]).includes(l.email)).length
+        : sent.filter(l => l.added_to_sub).length;
+    const total = sent.length;
     return {
       ...camp,
-      leads, total, opened, clicked, replied, bounced, unsubscribed, added_to_sub,
-      open_rate:  total ? +(opened/total*100).toFixed(1)  : 0,
-      reply_rate: total ? +(replied/total*100).toFixed(1) : 0,
-      click_rate: total ? +(clicked/total*100).toFixed(1) : 0,
+      leads:        inWindow,
+      total,
+      opened:       opened.length,
+      clicked:      clicked.length,
+      replied:      replied.length,
+      bounced, unsubscribed, added_to_sub,
+      open_rate:  total ? +(opened.length /total*100).toFixed(1)  : 0,
+      reply_rate: total ? +(replied.length/total*100).toFixed(1) : 0,
+      click_rate: total ? +(clicked.length/total*100).toFixed(1) : 0,
     };
   };
 
@@ -3225,12 +3237,15 @@ function applyDate(silent){
       .map(filterCamp)
       .filter(s => (s.total||0) > 0);
 
-  // Positive leads (parent + sub) — keep those whose reply_time falls in window
+  // Positive leads (parent + sub) — only those whose REPLY happened in window.
+  // Important: scan the FULL unfiltered campaigns, because a positive reply
+  // on May 3 to a lead sent April 28 must still count even though sent_time
+  // is outside the window (it'd otherwise be dropped by the campaign filter).
   const POS = new Set(["interested","meeting booked","positive","meeting request","will buy","warm","demo request"]);
   filtered.positive_leads = [];
-  filtered.parent_campaigns.forEach(p=>{
+  (DATA_FULL.parent_campaigns || []).forEach(p=>{
     (p.leads||[]).forEach(l=>{
-      if(POS.has((l.category||"").toLowerCase())){
+      if(POS.has((l.category||"").toLowerCase()) && inRange(l.reply_time)){
         filtered.positive_leads.push({
           ...l,
           name: l.name || l.email || "Unknown",
@@ -3241,9 +3256,9 @@ function applyDate(silent){
     });
   });
   filtered.sub_positive_leads = [];
-  filtered.subsequences.forEach(s=>{
+  (DATA_FULL.subsequences || []).forEach(s=>{
     (s.leads||[]).forEach(l=>{
-      if(POS.has((l.category||"").toLowerCase())){
+      if(POS.has((l.category||"").toLowerCase()) && inRange(l.reply_time)){
         filtered.sub_positive_leads.push({
           ...l,
           name: l.name || l.email || "Unknown",
