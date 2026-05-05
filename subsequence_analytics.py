@@ -3,6 +3,7 @@ import os
 import csv
 import json
 import re
+import time
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
@@ -50,9 +51,27 @@ def resolve_client(campaign_name):
 
 
 def get_all_campaigns():
-    response = requests.get(f"{BASE_URL}/campaigns?api_key={API_KEY}")
-    response.raise_for_status()
-    return response.json()
+    """Fetch all Smartlead campaigns with timeout + retry on transient errors."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            response = requests.get(
+                f"{BASE_URL}/campaigns?api_key={API_KEY}",
+                timeout=30,  # don't hang forever if Smartlead is slow
+            )
+            response.raise_for_status()
+            return response.json()
+        except (requests.Timeout, requests.ConnectionError) as e:
+            last_err = e
+            time.sleep(5 * (attempt + 1))  # backoff: 5s, 10s, 15s
+        except requests.HTTPError as e:
+            # 429 (rate limit) — retry; other 4xx/5xx — fail fast
+            if e.response is not None and e.response.status_code == 429:
+                last_err = e
+                time.sleep(10 * (attempt + 1))
+            else:
+                raise
+    raise last_err if last_err else RuntimeError("get_all_campaigns failed after retries")
 
 
 def get_campaign_stats(campaign_id):
