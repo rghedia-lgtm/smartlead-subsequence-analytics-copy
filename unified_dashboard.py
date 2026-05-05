@@ -1138,6 +1138,15 @@ def api_client(slug):
                 pos_leads.append(_slim_lead(l, p.get("client", "")))
     stats["positive"] = len(pos_leads)
 
+    # Positive leads from sub-sequences (separate count)
+    sub_pos_leads = []
+    for s in subs:
+        for l in s.get("leads", []):
+            if (l.get("category") or "").lower() in POSITIVE:
+                sub_pos_leads.append(_slim_lead(
+                    l, f"{s.get('parent','')} → {s.get('subsequence','')}"))
+    stats["sub_positive"] = len(sub_pos_leads)
+
     # ── LinkedIn — filter campaigns/convos/leads by client keyword ────
     li_campaigns, li_convos, li_leads = [], [], []
     li_stats = {"sent": 0, "accepted": 0, "replies": 0,
@@ -1283,6 +1292,7 @@ def api_client(slug):
         "parent_campaigns": parents,
         "subsequences":    subs,
         "positive_leads":  pos_leads,
+        "sub_positive_leads": sub_pos_leads,
         "linkedin": {
             "campaigns":     li_campaigns,
             "lead_events":   li_leads[:500],
@@ -3212,7 +3222,7 @@ function applyDate(silent){
       .map(filterCamp)
       .filter(s => (s.total||0) > 0);
 
-  // Positive leads — keep those whose reply_time falls in window
+  // Positive leads (parent + sub) — keep those whose reply_time falls in window
   const POS = new Set(["interested","meeting booked","positive","meeting request","will buy","warm","demo request"]);
   filtered.positive_leads = [];
   filtered.parent_campaigns.forEach(p=>{
@@ -3222,6 +3232,19 @@ function applyDate(silent){
           ...l,
           name: l.name || l.email || "Unknown",
           campaign: p.raw_name || p.client || "",
+          messages: l.messages || [],
+        });
+      }
+    });
+  });
+  filtered.sub_positive_leads = [];
+  filtered.subsequences.forEach(s=>{
+    (s.leads||[]).forEach(l=>{
+      if(POS.has((l.category||"").toLowerCase())){
+        filtered.sub_positive_leads.push({
+          ...l,
+          name: l.name || l.email || "Unknown",
+          campaign: `${s.parent||""} → ${s.subsequence||""}`,
           messages: l.messages || [],
         });
       }
@@ -3243,6 +3266,7 @@ function applyDate(silent){
     sub_clicked:  sum(filtered.subsequences,    "clicked"),
     sub_replied:  sum(filtered.subsequences,    "replied"),
     positive:     filtered.positive_leads.length,
+    sub_positive: filtered.sub_positive_leads.length,
   };
 
   DATA = filtered;
@@ -3315,36 +3339,36 @@ function renderLIStats(){
 
 function renderStats(){
   const s = DATA.stats || {};
+  // Helper: positive leads from sub-sequences (server-provided)
+  const subPositiveLeads = () => DATA.sub_positive_leads || [];
   const cards = [
-    {key:"sent",         lbl:"Sent",          val:s.sent,         icon:"📤", col:"c-blue",
-     leads:()=>collectLeads(p=>true)},
-    {key:"opened",       lbl:"Opened",        val:s.opened,       icon:"👁",  col:"c-green",
-     sub:pct(s.opened,s.sent),
+    // ── PARENT CAMPAIGNS ─────────────────────────────────────────
+    {key:"sent",         lbl:"Parent Sent",     val:s.sent,         icon:"📤", col:"c-blue",
+     leads:()=>collectLeads(()=>true)},
+    {key:"opened",       lbl:"Parent Opened",   val:s.opened,       icon:"👁",  col:"c-green",
+     sub:pct(s.opened, s.sent),
      leads:()=>collectLeads(l=>l.open_time)},
-    {key:"clicked",      lbl:"Clicked",       val:s.clicked,      icon:"🖱",  col:"c-cyan",
-     sub:pct(s.clicked,s.sent),
-     leads:()=>collectLeads(l=>l.click_time)},
-    {key:"replied",      lbl:"Replied",       val:s.replied,      icon:"💬", col:"c-amber",
-     sub:pct(s.replied,s.sent),
+    {key:"replied",      lbl:"Parent Replied",  val:s.replied,      icon:"💬", col:"c-amber",
+     sub:pct(s.replied, s.sent),
      leads:()=>collectLeads(l=>l.reply_time)},
-    {key:"added_to_sub", lbl:"Added to Sub",  val:s.added_to_sub, icon:"➕", col:"c-purple",
-     sub:pct(s.added_to_sub,s.sent),
+    {key:"positive",     lbl:"Parent Positive Replied", val:s.positive, icon:"✅", col:"c-green",
+     sub:pct(s.positive, s.replied),
+     leads:()=>(DATA.positive_leads || [])},
+    // ── SUB-SEQUENCES ────────────────────────────────────────────
+    {key:"sub_sent",     lbl:"Sub Sent",        val:s.sub_total,    icon:"📨", col:"c-purple",
      leads:()=>subLeads(()=>true)},
-    {key:"sub_opened",   lbl:"Sub Opened",    val:s.sub_opened,   icon:"📖", col:"c-orange",
-     sub:pct(s.sub_opened,s.sub_total),
+    {key:"sub_opened",   lbl:"Sub Opened",      val:s.sub_opened,   icon:"📖", col:"c-orange",
+     sub:pct(s.sub_opened, s.sub_total),
      leads:()=>subLeads(l=>l.open_time)},
-    {key:"sub_clicked",  lbl:"Sub Clicked",   val:s.sub_clicked,  icon:"🎯", col:"c-rose",
-     sub:pct(s.sub_clicked,s.sub_total),
+    {key:"sub_clicked",  lbl:"Sub Clicked",     val:s.sub_clicked,  icon:"🎯", col:"c-cyan",
+     sub:pct(s.sub_clicked, s.sub_total),
      leads:()=>subLeads(l=>l.click_time)},
-    {key:"sub_replied",  lbl:"Sub Replied",   val:s.sub_replied,  icon:"📨", col:"c-amber",
-     sub:pct(s.sub_replied,s.sub_total),
+    {key:"sub_replied",  lbl:"Sub Replied",     val:s.sub_replied,  icon:"💬", col:"c-amber",
+     sub:pct(s.sub_replied, s.sub_total),
      leads:()=>subLeads(l=>l.reply_time)},
-    {key:"positive",     lbl:"Positive Replies", val:s.positive,  icon:"✅", col:"c-green",
-     leads:()=>(DATA.positive_leads||[])},
-    {key:"bounced",      lbl:"Bounced",       val:s.bounced,      icon:"⚠",  col:"c-rose",
-     leads:()=>collectLeads(l=>(l.category||"").toLowerCase()==="bounced")},
-    {key:"unsubscribed", lbl:"Unsubscribed",  val:s.unsubscribed, icon:"🚫", col:"c-slate",
-     leads:()=>collectLeads(l=>(l.category||"").toLowerCase()==="unsubscribed")},
+    {key:"sub_positive", lbl:"Sub Positive Replied", val:s.sub_positive || 0, icon:"✅", col:"c-green",
+     sub:pct(s.sub_positive, s.sub_replied),
+     leads:()=>subPositiveLeads()},
   ];
   document.getElementById("stats-grid").innerHTML = cards.map((c,i)=>`
     <div class="stat-card ${c.col}" data-idx="${i}">
