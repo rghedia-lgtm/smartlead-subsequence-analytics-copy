@@ -101,6 +101,40 @@ if _e_data:
              len(_e_data.get("parent_analytics", [])),
              len(_e_data.get("sub_analytics", [])))
 
+# Synchronous module-level load from data/cache.json.gz. Avoids the
+# warmup-thread-hang we kept hitting on Render: the file is shipped
+# with the deploy, decompresses in <1s, fully populates EMAIL_CACHE +
+# LI_CACHE before gunicorn accepts the first request.
+_LOCAL_CACHE_BOOT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "data", "cache.json.gz")
+if os.path.exists(_LOCAL_CACHE_BOOT) and not EMAIL_CACHE["data"]:
+    try:
+        import gzip as _gzip
+        with _gzip.open(_LOCAL_CACHE_BOOT, "rb") as _gz:
+            _payload = json.loads(_gz.read().decode("utf-8"))
+        _email = _payload.get("email") or {}
+        EMAIL_CACHE["data"] = {
+            "parent_analytics": _email.get("parent_analytics", []),
+            "sub_analytics":    _email.get("sub_analytics", []),
+        }
+        EMAIL_CACHE["ts"] = time.time()
+        _db_save("email_cache", EMAIL_CACHE["data"])
+        _li = _payload.get("linkedin")
+        if _li:
+            LI_CACHE["data"] = (
+                _li.get("accounts", []),
+                _li.get("campaigns", []),
+                _li.get("recent_leads", []),
+                _li.get("conversations", []),
+            )
+            LI_CACHE["ts"] = time.time()
+        log.info("[boot] cache.json.gz loaded: %d parents, %d subs, total_sent=%s",
+                 len(EMAIL_CACHE["data"]["parent_analytics"]),
+                 len(EMAIL_CACHE["data"]["sub_analytics"]),
+                 _payload.get("stats", {}).get("total_sent"))
+    except Exception as _e:
+        log.warning("[boot] cache.json.gz load failed: %s", _e)
+
 SAMPLE_EMAIL_DATA = {
     "loading": True,
     "parent_analytics": [
@@ -4020,8 +4054,12 @@ def _scheduled_refresher():
 
 # Pre-populate email cache in background so it's ready when the page first loads.
 # Runs under both `python unified_dashboard.py` and gunicorn (Render).
-if os.getenv("SMARTLEAD_API_KEY") and not os.getenv("DISABLE_SCHEDULER"):
-    threading.Thread(target=get_email_data, daemon=True).start()
+# NOTE: boot-time synchronous load (above) already populates EMAIL_CACHE from
+# data/cache.json.gz. The warmup thread is only for periodic refresh from
+# the GitHub data-cache branch (when LOCAL_FETCH=1 it would call Smartlead).
+# We skip it on Render to avoid worker hangs — the cache is already loaded
+# at boot. Set ENABLE_REFRESH_THREAD=1 to opt in.
+if os.getenv("ENABLE_REFRESH_THREAD") == "1" and not os.getenv("DISABLE_SCHEDULER"):
     threading.Thread(target=_scheduled_refresher, daemon=True).start()
     log.info("[scheduler] Auto-refresh enabled (every %d min)", REFRESH_EVERY // 60)
 
