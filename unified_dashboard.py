@@ -1305,6 +1305,14 @@ def client_dashboard(slug):
 
 @app.route("/")
 def index():
+    # Default landing page is the Kendra client dashboard.
+    # The full multi-client view is still available at /all.
+    from flask import redirect
+    return redirect("/client/kendra", code=302)
+
+
+@app.route("/all")
+def index_all():
     return render_template_string(DASHBOARD_HTML, clients=CLIENTS)
 
 
@@ -1594,7 +1602,7 @@ tbody tr:hover td{background:#fafbff}
 <!-- Client tab navigation -->
 <div style="background:#fff;border-bottom:1px solid #e2e8f0;padding:10px 28px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;position:sticky;top:56px;z-index:150">
   <span style="font-size:10px;font-weight:800;color:#94a3b8;text-transform:uppercase;letter-spacing:1px;margin-right:6px">View:</span>
-  <a href="/" style="padding:6px 14px;border-radius:7px;font-size:12px;font-weight:700;text-decoration:none;background:#4f46e5;color:#fff">All Clients</a>
+  <a href="/all" style="padding:6px 14px;border-radius:7px;font-size:12px;font-weight:700;text-decoration:none;background:#4f46e5;color:#fff">All Clients</a>
   {% for c in clients %}
   <a href="/client/{{c.slug}}" style="padding:6px 14px;border-radius:7px;font-size:12px;font-weight:700;text-decoration:none;background:#f1f5f9;color:#475569;border:1px solid #e2e8f0">{{c.name}}</a>
   {% endfor %}
@@ -2974,7 +2982,7 @@ tbody tr:hover td{background:#fafbff}
 
 <div class="client-tabs">
   <span class="tlbl">View:</span>
-  <a href="/">All Clients</a>
+  <a href="/all">All Clients</a>
   {% for c in clients %}
   <a href="/client/{{c.slug}}" class="{% if c.slug == client.slug %}active{% endif %}">{{c.name}}</a>
   {% endfor %}
