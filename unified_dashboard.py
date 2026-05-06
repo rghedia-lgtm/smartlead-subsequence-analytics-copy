@@ -3902,12 +3902,10 @@ function renderPositive(){
 }
 // Render a list of email messages as chat bubbles.
 // Outbound (sent by us) → right side, indigo. Inbound (replies) → left, gray.
-function renderChatThread(messages){
-  if(!messages || !messages.length){
-    return '<div class="chat-empty">No messages stored for this lead.<br><span style="font-size:10px">Sub-sequence and non-positive leads have message bodies trimmed in the cache to keep the file small.</span></div>';
-  }
-  // Sort by time so the conversation reads top→bottom chronologically
-  const sorted = messages.slice().sort((a,b)=>{
+// If `lead.reply_time` is set but no inbound message is in `messages`,
+// append a placeholder bubble so the user sees that the lead DID reply.
+function renderChatThread(messages, lead){
+  const msgs = (messages || []).slice().sort((a,b)=>{
     const ta = (a.time||""), tb = (b.time||"");
     return ta < tb ? -1 : ta > tb ? 1 : 0;
   });
@@ -3915,17 +3913,37 @@ function renderChatThread(messages){
     const t = (m.type||"").toLowerCase();
     return t === "inbound" || t === "received" || t === "reply" || t === "replied";
   };
-  return `<div class="chat-thread">${sorted.map(m=>{
+
+  // Inject a placeholder for the lead's reply if we know they replied
+  // but Smartlead's API didn't return the reply body.
+  if(lead && lead.reply_time && !msgs.some(isInbound)){
+    msgs.push({
+      type:    "inbound",
+      from:    lead.name || lead.email || "Lead",
+      time:    lead.reply_time,
+      body:    "[Lead replied — full reply text isn't exposed by Smartlead's API. Open Smartlead's Master Inbox or your Outlook/Gmail to read it.]",
+      _placeholder: true,
+    });
+  }
+
+  if(!msgs.length){
+    return '<div class="chat-empty">No messages stored for this lead.<br><span style="font-size:10px">Sub-sequence and non-positive leads have message bodies trimmed in the cache to keep the file small.</span></div>';
+  }
+
+  return `<div class="chat-thread">${msgs.map(m=>{
     const cls   = isInbound(m) ? "chat-in"  : "chat-out";
     const label = isInbound(m) ? "Received" : "Sent";
     const from  = m.from ? escapeHtml(m.from) : "";
     const time  = m.time ? escapeHtml(m.time.replace("T", " ").slice(0,16)) : "";
-    return `<div class="chat-bubble ${cls}">
+    const body  = m._placeholder
+      ? `<em style="opacity:.7">${escapeHtml(m.body)}</em>`
+      : escapeHtml(m.body||"").replace(/\n/g,"<br>");
+    return `<div class="chat-bubble ${cls}"${m._placeholder?' style="opacity:.85"':''}>
       <div class="chdr">
         <span>${label}${from?" · "+from:""}</span>
         <span>${time}</span>
       </div>
-      ${escapeHtml(m.body||"").replace(/\n/g,"<br>")}
+      ${body}
     </div>`;
   }).join("")}</div>`;
 }
@@ -3938,7 +3956,7 @@ function openConvo(i){
       <div class="lead-name">${escapeHtml(l.name||"")}</div>
       <div class="lead-meta">${escapeHtml(l.email||"")} · ${escapeHtml(l.campaign||"")} · <span class="badge b-pos">${escapeHtml(l.category||"")}</span></div>
     </div>
-    ${renderChatThread(l.messages || [])}`;
+    ${renderChatThread(l.messages || [], l)}`;
   document.getElementById("modal-ovl").classList.add("show");
 }
 
@@ -4051,13 +4069,14 @@ function openLeadModal(title, leads){
       if(l.open_time)  events.push(`opened ${escapeHtml(l.open_time.slice(0,10))}`);
       if(l.click_time) events.push(`clicked ${escapeHtml(l.click_time.slice(0,10))}`);
       if(l.reply_time) events.push(`replied ${escapeHtml(l.reply_time.slice(0,10))}`);
-      const hasMsgs = (l.messages||[]).length > 0;
-      const toggle = hasMsgs
-        ? `<span class="clickable" onclick="toggleLeadThread(${idx})">View ${(l.messages||[]).length} msgs ▼</span>`
+      const hasMsgs    = (l.messages||[]).length > 0;
+      const hasReply   = !!l.reply_time;
+      const toggle = (hasMsgs || hasReply)
+        ? `<span class="clickable" onclick="toggleLeadThread(${idx})">View thread ▼</span>`
         : "";
       return `<div class="lead-row" id="ld-${idx}">
         <div class="lead-name">${escapeHtml(l.name||l.email||"Unknown")} ${cat}</div>
-        <div class="lead-meta">${escapeHtml(l.email||"")} · ${escapeHtml(l._campaign||l.campaign||"")} · ${events.join(" · ")} ${hasMsgs?"· "+toggle:""}</div>
+        <div class="lead-meta">${escapeHtml(l.email||"")} · ${escapeHtml(l._campaign||l.campaign||"")} · ${events.join(" · ")} ${toggle?"· "+toggle:""}</div>
         <div id="ld-${idx}-thread" style="display:none;margin-top:8px"></div>
       </div>`;
     }).join("");
@@ -4073,7 +4092,7 @@ function toggleLeadThread(idx){
   if(!el) return;
   if(el.style.display === "none"){
     const lead = (window.__currentModalLeads || [])[idx];
-    el.innerHTML = renderChatThread(lead?.messages || []);
+    el.innerHTML = renderChatThread(lead?.messages || [], lead);
     el.style.display = "block";
   } else {
     el.style.display = "none";
