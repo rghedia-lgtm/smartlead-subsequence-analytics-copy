@@ -12,6 +12,7 @@ import json, os, sys, logging, time, threading
 from collections import defaultdict
 from datetime import datetime
 
+import requests
 from flask import Flask, jsonify, render_template_string, request, send_file
 from dotenv import load_dotenv
 
