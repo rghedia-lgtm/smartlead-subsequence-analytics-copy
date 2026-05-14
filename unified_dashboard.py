@@ -399,20 +399,14 @@ def _load_local_cache_file():
 
 
 def _fetch_remote_cache():
-    """Read cache.json.gz. Tries in order:
-      1. Local file shipped with the deploy (data/cache.json.gz on disk)
-      2. GitHub raw URL (data-cache branch — populated by the cron job)
-    The local file is instant; the GitHub URL is a fallback for when the
-    Actions cron has pushed newer data than the deploy contains."""
+    """Read cache.json.gz. Tries remote first so the dashboard picks up fresh
+    data pushed by the Actions cron without needing a redeploy:
+      1. GitHub raw URL (data-cache branch — refreshed by sync-cache.yml)
+      2. Local file shipped with the deploy (fallback when GitHub is unreachable)
+    """
     import gzip, io
 
-    # ── Path 1: local file (fast, no network) ────────────────────
-    local = _load_local_cache_file()
-    if local:
-        log.info("[cache] Loaded from local data/cache.json.gz")
-        return local
-
-    # ── Path 2: GitHub raw URL ───────────────────────────────────
+    # ── Path 1: GitHub raw URL (freshest — Actions cron pushes here) ─
     headers = {"Cache-Control": "no-cache"}
     token = os.getenv("GITHUB_CACHE_TOKEN") or os.getenv("GITHUB_TOKEN")
     if token:
@@ -429,8 +423,14 @@ def _fetch_remote_cache():
                 return json.loads(gz.read().decode("utf-8"))
         return json.loads(content.decode("utf-8"))
     except Exception as e:
-        log.warning("[remote] cache fetch failed: %s", e)
-        return None
+        log.warning("[remote] cache fetch failed, falling back to local: %s", e)
+
+    # ── Path 2: local file (last-known-good, ships with the deploy) ──
+    local = _load_local_cache_file()
+    if local:
+        log.info("[cache] Loaded from local data/cache.json.gz (remote unavailable)")
+        return local
+    return None
 
 
 def _apply_remote_cache(payload):
@@ -4205,11 +4205,11 @@ loadAll();
 # ── Background scheduler: keeps cache fresh so dashboard is always instant ──
 def _scheduled_refresher():
     """Refreshes email cache every REFRESH_EVERY seconds (25 min by default).
-    Runs forever in a daemon thread. First refresh waits REFRESH_EVERY since
-    startup pre-fetch already covers the initial load."""
+    Fires an initial refresh ~15s after boot so the dashboard picks up the
+    latest data-cache branch contents quickly, then loops on REFRESH_EVERY."""
+    time.sleep(15)  # let gunicorn finish booting before the first network call
     while True:
         try:
-            time.sleep(REFRESH_EVERY)
             log.info("[scheduler] Auto-refreshing email cache...")
             t0 = time.time()
             get_email_data(force=True)
@@ -4217,16 +4217,14 @@ def _scheduled_refresher():
         except Exception as e:
             log.error("[scheduler] Refresh failed: %s", e, exc_info=True)
             time.sleep(60)  # back off briefly on error
+        time.sleep(REFRESH_EVERY)
 
 
-# Pre-populate email cache in background so it's ready when the page first loads.
-# Runs under both `python unified_dashboard.py` and gunicorn (Render).
-# NOTE: boot-time synchronous load (above) already populates EMAIL_CACHE from
-# data/cache.json.gz. The warmup thread is only for periodic refresh from
-# the GitHub data-cache branch (when LOCAL_FETCH=1 it would call Smartlead).
-# We skip it on Render to avoid worker hangs — the cache is already loaded
-# at boot. Set ENABLE_REFRESH_THREAD=1 to opt in.
-if os.getenv("ENABLE_REFRESH_THREAD") == "1" and not os.getenv("DISABLE_SCHEDULER"):
+# Enable auto-refresh by default so the dashboard pulls fresh cache from the
+# GitHub data-cache branch (populated by sync-cache.yml every 30 min) without
+# requiring a redeploy. The thread is daemon + has tight HTTP timeouts so it
+# can't hang the worker. Set DISABLE_SCHEDULER=1 to opt out.
+if not os.getenv("DISABLE_SCHEDULER"):
     threading.Thread(target=_scheduled_refresher, daemon=True).start()
     log.info("[scheduler] Auto-refresh enabled (every %d min)", REFRESH_EVERY // 60)
 
