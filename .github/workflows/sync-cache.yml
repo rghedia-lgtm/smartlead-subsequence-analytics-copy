@@ -35,6 +35,54 @@ jobs:
           AIMFOX_API_KEY:    ${{ secrets.AIMFOX_API_KEY }}
         run: python sync_cache.py
 
+      # MUST slim leads before pushing to data-cache. The unified_dashboard
+      # worker on Render free-tier has 512MB and OOMs when json.loads()-ing
+      # the full payload (~17MB gz / ~113MB raw). Slim drops sent-only leads
+      # and caps each campaign at 30 engaged leads. Aggregate stats (total/
+      # opened/replied) are pre-computed elsewhere and stay correct.
+      - name: Slim cache.json.gz to fit Render free-tier worker
+        run: |
+          python << 'PY'
+          import gzip, json, os
+          GZ = "data/cache.json.gz"
+          MAX_LEADS = 30
+          POS = {"interested","meeting booked","positive","meeting request",
+                 "will buy","warm","demo request"}
+
+          def slim(leads):
+              if not leads: return leads
+              def pri(l):
+                  cat = (l.get("category") or "").lower()
+                  if cat in POS: return 0
+                  if l.get("reply_time"): return 1
+                  if l.get("click_time"): return 2
+                  if l.get("open_time"):  return 3
+                  return 4
+              eng = sorted(
+                  [l for l in leads if l.get("open_time") or l.get("click_time") or l.get("reply_time")],
+                  key=pri,
+              )[:MAX_LEADS]
+              for l in eng:
+                  if not l.get("reply_time"):
+                      l["messages"] = []
+              return eng
+
+          before = os.path.getsize(GZ)
+          with gzip.open(GZ, "rb") as f:
+              d = json.loads(f.read().decode("utf-8"))
+          parents = d.get("email", {}).get("parent_analytics", [])
+          subs    = d.get("email", {}).get("sub_analytics", [])
+          for p in parents: p["leads"] = slim(p.get("leads") or [])
+          for s in subs:    s["leads"] = slim(s.get("leads") or [])
+          raw = json.dumps(d, default=str, ensure_ascii=False).encode("utf-8")
+          with gzip.open(GZ, "wb", compresslevel=9) as f:
+              f.write(raw)
+          after = os.path.getsize(GZ)
+          print(f"slim: {before/1024/1024:.1f}MB -> {after/1024/1024:.1f}MB gz "
+                f"({len(parents)} parents, {len(subs)} subs, "
+                f"total_sent={d.get('stats',{}).get('total_sent')})")
+          PY
+
       - name: Commit cache.json to data-cache branch
         run: |
           set -e
